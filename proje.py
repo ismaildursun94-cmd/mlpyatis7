@@ -90,6 +90,7 @@ def stage(msg): print(f"[STAGE] {msg}", flush=True)
 # ---------- yardımcılar ----------
 def _norm_text_basic(s: str) -> str:
     """Unicode -> aksan temizle -> boşluk sıkıştır -> lower"""
+    if s is None: return ""
     s = unicodedata.normalize("NFKD", str(s))
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     s = re.sub(r"\s+", " ", s).strip().lower()
@@ -270,7 +271,7 @@ if WINSORIZE_ON:
 # ================== 3) LOOKUP TABLOLARI (train) ==================
 stage("Lookup tabloları (train)")
 
-# ---- DEĞİŞİKLİK: named-agg ile stabil toplulaştırma (reset_index çakışma hatası yok)
+# named-agg ile stabil toplulaştırma
 lkp3 = (
     train_df
     .groupby(["YaşGrup","Bölüm","ICD_Set_Key"], as_index=False)
@@ -477,7 +478,11 @@ def guardrails(yg:str, bolum:str, target_key:str, pred:float):
     return floor3
 
 def predict_one(yg:str, bolum:str, target_key:str):
+    # girişleri train'deki kanonik değerlere eşitle
+    yg, bolum = canon_demo(yg, bolum)
+
     src, anchor_p50, n, anchor_key = find_anchor(yg, bolum, target_key)
+
     # 3D/2D/1D birebir eşleşme → short-circuit
     if anchor_p50 is not None and anchor_key == target_key and src in ("3D","2D","1D"):
         meta = {"ANCHOR_SRC": src, "ANCHOR_KEY": anchor_key or "", "ANCHOR_P50": float(anchor_p50),
@@ -552,7 +557,11 @@ if XGB_ENS_ON:
     def xgb_predict_ens(yg, bolum, key, icd_list_norm=None):
         if icd_list_norm is None:
             icd_list_norm = key.split("||") if key else []
-        df_one = pd.DataFrame({"Bölüm":[bolum],"YaşGrup":[yg],"ICD_List_Norm":[icd_list_norm],"ICD_Sayısı":[len(icd_list_norm)]})
+        df_one = pd.DataFrame({"Bölüm":[yg and bolum][0],"YaşGrup":[yg],
+                               "ICD_List_Norm":[icd_list_norm],"ICD_Sayısı":[len(icd_list_norm)]})
+        # Not: yukarıdaki satır sadece sütunları oluşturmak için; değerler önemlidir.
+        df_one = pd.DataFrame({"Bölüm":[bolum],"YaşGrup":[yg],
+                               "ICD_List_Norm":[icd_list_norm],"ICD_Sayısı":[len(icd_list_norm)]})
         X_one = _pack_features(df_one)
         p_plain = float(xgb_plain.predict(X_one)[0]); p_log = float(np.expm1(xgb_log.predict(X_one)[0]))
         p_ens = (1.0 - float(XGB_ALPHA_LOG)) * p_plain + float(XGB_ALPHA_LOG) * p_log
@@ -635,7 +644,7 @@ if TRUE_LOS_COL is None:
 
 n_3d_valid = 0
 for r in tqdm(valid_df.itertuples(), total=len(valid_df), desc="VALID_PREDICTIONS"):
-    yg, bol = canon_demo(r.YaşGrup, r.Bölüm)  # <-- kanonik
+    yg, bol = canon_demo(r.YaşGrup, r.Bölüm)  # kanonik
     key = r.ICD_Set_Key
 
     if TRUE_LOS_COL is not None:
@@ -713,7 +722,7 @@ def app_normalize_inputs(yas_grup: str, bolum: str, icd_input) -> tuple:
     """
     yg_in = str(yas_grup or "").strip()
     b_in  = str(bolum or "").strip()
-    yg, b = canon_demo(yg_in, b_in)  # <--- kritik: kanonik demo
+    yg, b = canon_demo(yg_in, b_in)  # kritik: kanonik demo
 
     if isinstance(icd_input, str):
         parts = [clean_icd(p) for p in re.split(r"[;,]", icd_input) if p.strip()]
@@ -793,7 +802,7 @@ def tahmin_et(icd_list, bolum=None, yas_grup=None):
     parts = sorted(set([p for p in parts if p]))
     key = "||".join(parts)
 
-    yg, b = canon_demo((yas_grup or "").strip(), (bolum or "").strip())  # <--- kanonik
+    yg, b = canon_demo((yas_grup or "").strip(), (bolum or "").strip())  # kanonik
 
     pred_rule, meta = predict_one(yg, b, key)
     p_plain, p_log, p_ens = xgb_predict_ens(yg, b, key, parts)
