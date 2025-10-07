@@ -87,6 +87,14 @@ __all__ = [
 
 def stage(msg): print(f"[STAGE] {msg}", flush=True)
 
+# ---------- yardımcılar ----------
+def _norm_text_basic(s: str) -> str:
+    """Unicode -> aksan temizle -> boşluk sıkıştır -> lower"""
+    s = unicodedata.normalize("NFKD", str(s))
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    return s
+
 def round_half_up(x):
     if pd.isna(x): return None
     return int(Decimal(str(float(x))).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
@@ -214,7 +222,7 @@ df["ICD_Set_Key"] = df["ICD_Set_Key"].apply(clean_icd_set_key)
 df["ICD_Sayısı"] = df["ICD_List_Norm"].apply(len)
 df = df[~(REQUIRE_ICD & (df["ICD_Sayısı"]==0))].copy()
 
-# Embedding metni (kullanılmıyor; kaynak saklı)
+# Embedding metni (opsiyonel kaynak)
 base_text_col = "ICD Adi Ve Kodu" if "ICD Adi Ve Kodu" in df.columns else "ICD Kodu"
 df["ICD_Text_Embed"] = df[base_text_col].map(clean_text_anywhere_tags).fillna("")
 
@@ -222,8 +230,18 @@ df["ICD_Text_Embed"] = df[base_text_col].map(clean_text_anywhere_tags).fillna(""
 df["Yaş_Yıl_Int"] = pd.to_numeric(df["Yaş"], errors="coerce").round().astype("Int64")
 df["YaşGrup"] = df["Yaş"].apply(yas_to_group)
 
+# --- Demo kanonik sözlükleri (tam eşleşme garantisi için) ---
+YG_UNIQ = { _norm_text_basic(v): v for v in df["YaşGrup"].dropna().astype(str).unique() }
+BOLUM_UNIQ = { _norm_text_basic(v): v for v in df["Bölüm"].dropna().astype(str).unique() }
+
+def canon_demo(yas_grup: str, bolum: str) -> tuple[str,str]:
+    yg = YG_UNIQ.get(_norm_text_basic(yas_grup), str(yas_grup or "").strip())
+    b  = BOLUM_UNIQ.get(_norm_text_basic(bolum), str(bolum or "").strip())
+    return yg, b
+
 # ================== 2) TRAIN/VALID SPLIT ==================
 stage("Train/Valid ayrımı")
+# ComboID sadece bilgi amaçlı
 df["ComboID"] = df["YaşGrup"].astype(str)+"||"+df["Bölüm"].astype(str)+"||"+df["ICD_Set_Key"].astype(str)
 
 if SPLIT_BY_COMBO:
@@ -252,42 +270,40 @@ if WINSORIZE_ON:
 # ================== 3) LOOKUP TABLOLARI (train) ==================
 stage("Lookup tabloları (train)")
 
-def _agg_frame(frame: pd.DataFrame) -> dict:
-    return {
-        "N": frame["Yatış Gün Sayısı"].count(),
-        "Ortalama": round_half_up(frame["Yatış Gün Sayısı"].mean()),
-        "P50": frame["Yatış Gün Sayısı"].median(),
-        "P90": frame["Yatış Gün Sayısı"].quantile(0.9),
-    }
-
-# Modern, güvenli agg — reset_index çakışması yok
+# ---- DEĞİŞİKLİK: named-agg ile stabil toplulaştırma (reset_index çakışma hatası yok)
 lkp3 = (
     train_df
-    .groupby(["YaşGrup", "Bölüm", "ICD_Set_Key"], as_index=False)
-    .agg(N=("Yatış Gün Sayısı","count"),
-         Ortalama=("Yatış Gün Sayısı", lambda x: round_half_up(x.mean())),
-         P50=("Yatış Gün Sayısı","median"),
-         P90=("Yatış Gün Sayısı", p90))
+    .groupby(["YaşGrup","Bölüm","ICD_Set_Key"], as_index=False)
+    .agg(
+        N=("Yatış Gün Sayısı","count"),
+        Ortalama=("Yatış Gün Sayısı", lambda x: round_half_up(x.mean())),
+        P50=("Yatış Gün Sayısı","median"),
+        P90=("Yatış Gün Sayısı", p90),
+    )
 )
 lkp3["ICD_Set_Key"] = lkp3["ICD_Set_Key"].apply(clean_icd_set_key)
 
 lkp2 = (
     train_df
-    .groupby(["Bölüm", "ICD_Set_Key"], as_index=False)
-    .agg(N=("Yatış Gün Sayısı","count"),
-         Ortalama=("Yatış Gün Sayısı", lambda x: round_half_up(x.mean())),
-         P50=("Yatış Gün Sayısı","median"),
-         P90=("Yatış Gün Sayısı", p90))
+    .groupby(["Bölüm","ICD_Set_Key"], as_index=False)
+    .agg(
+        N=("Yatış Gün Sayısı","count"),
+        Ortalama=("Yatış Gün Sayısı", lambda x: round_half_up(x.mean())),
+        P50=("Yatış Gün Sayısı","median"),
+        P90=("Yatış Gün Sayısı", p90),
+    )
 )
 lkp2["ICD_Set_Key"] = lkp2["ICD_Set_Key"].apply(clean_icd_set_key)
 
 lkp1 = (
     train_df
     .groupby(["ICD_Set_Key"], as_index=False)
-    .agg(N=("Yatış Gün Sayısı","count"),
-         Ortalama=("Yatış Gün Sayısı", lambda x: round_half_up(x.mean())),
-         P50=("Yatış Gün Sayısı","median"),
-         P90=("Yatış Gün Sayısı", p90))
+    .agg(
+        N=("Yatış Gün Sayısı","count"),
+        Ortalama=("Yatış Gün Sayısı", lambda x: round_half_up(x.mean())),
+        P50=("Yatış Gün Sayısı","median"),
+        P90=("Yatış Gün Sayısı", p90),
+    )
 )
 lkp1["ICD_Set_Key"] = lkp1["ICD_Set_Key"].apply(clean_icd_set_key)
 
@@ -301,14 +317,14 @@ lkp0 = pd.DataFrame({
 # Tekil ICD P50 (global)
 single = train_df[train_df["ICD_Sayısı"]==1].copy()
 single["ICD_Kod"] = single["ICD_List_Norm"].str[0]
-LKP_ICD = single.groupby("ICD_Kod", as_index=False)["Yatış Gün Sayısı"].agg(N="count", P50="median")
+LKP_ICD = single.groupby("ICD_Kod")["Yatış Gün Sayısı"].agg(N="count", P50="median").reset_index()
 
 # İkili set P50
 pairs = train_df[train_df["ICD_Sayısı"]==2].copy()
 pairs["PairKey"] = pairs["ICD_List_Norm"].apply(lambda lst: "||".join(sorted(lst)))
-LKP_PAIR = pairs.groupby(["YaşGrup","Bölüm","PairKey"], as_index=False)["Yatış Gün Sayısı"].agg(N="count", P50="median")
+LKP_PAIR = pairs.groupby(["YaşGrup","Bölüm","PairKey"])["Yatış Gün Sayısı"].agg(N="count", P50="median").reset_index()
 
-DEMO_P90_MAP = train_df.groupby(["YaşGrup","Bölüm"], as_index=False)["Yatış Gün Sayısı"].quantile(0.9).rename(columns={"Yatış Gün Sayısı":"P90"})
+DEMO_P90_MAP = train_df.groupby(["YaşGrup","Bölüm"])["Yatış Gün Sayısı"].quantile(0.9).reset_index().rename(columns={"Yatış Gün Sayısı":"P90"})
 demop90_map = {(r["YaşGrup"], r["Bölüm"]): float(r["P90"]) for _, r in DEMO_P90_MAP.iterrows()}
 
 # ================== 4) β / γ ÖĞREN ==================
@@ -352,14 +368,7 @@ for pair, samples in pair_to_gamma_samples.items():
 # ================== 5) LOOKUP EXCEL ==================
 stage("Lookup Excel yazılıyor")
 _br_base = df[["ICD_Set_Key","ICD_List_Norm"]].copy()
-BR_ICDSET_MAP = (
-    _br_base
-    .explode("ICD_List_Norm")
-    .rename(columns={"ICD_List_Norm":"ICD"})
-    .dropna(subset=["ICD"])
-    .drop_duplicates()
-    .reset_index(drop=True)
-)
+BR_ICDSET_MAP = _br_base.explode("ICD_List_Norm").rename(columns={"ICD_List_Norm":"ICD"}).dropna(subset=["ICD"]).drop_duplicates().reset_index(drop=True)
 DIM_ICD = pd.DataFrame({"ICD": sorted({icd for lst in df["ICD_List_Norm"] for icd in lst})})
 _age_order = ["0-1","2-5","5-10","10-15","15-25","25-35","35-50","50-65","65+"]
 _present = [yg for yg in _age_order if yg in set(df["YaşGrup"].dropna().astype(str).unique())]
@@ -395,6 +404,7 @@ for _, r in LKP_PAIR.iterrows():
 single_floor_map = dict(zip(LKP_ICD["ICD_Kod"], LKP_ICD["P50"]))
 
 def find_anchor(yg:str, bolum:str, key:str):
+    # Tam eşleşme -> kısa devre
     if (yg, bolum, key) in lkp3_map:
         p50, n = lkp3_map[(yg, bolum, key)]; return "3D", float(p50), n, key
     if (bolum, key) in lkp2_map:
@@ -625,7 +635,9 @@ if TRUE_LOS_COL is None:
 
 n_3d_valid = 0
 for r in tqdm(valid_df.itertuples(), total=len(valid_df), desc="VALID_PREDICTIONS"):
-    yg, bol, key = r.YaşGrup, r.Bölüm, r.ICD_Set_Key
+    yg, bol = canon_demo(r.YaşGrup, r.Bölüm)  # <-- kanonik
+    key = r.ICD_Set_Key
+
     if TRUE_LOS_COL is not None:
         _val = valid_df.loc[r.Index, TRUE_LOS_COL]
         try: true_los = float(_val) if pd.notna(_val) else np.nan
@@ -692,16 +704,17 @@ if "PRED_RULE" in valid_pred_df.columns:
     _metrics(valid_pred_df["True_LOS"], valid_pred_df["PRED_RULE"], "KURAL (Rule)")
 if "PRED_XGB_ENS" in valid_pred_df.columns:
     _metrics(valid_pred_df["True_LOS"], valid_pred_df["PRED_XGB_ENS"], "XGB (Plain+Log Ens)")
-# ---- /VALID ----
 
 # ================== 11) APP KULLANIMI – FONKSİYONLAR ==================
 def app_normalize_inputs(yas_grup: str, bolum: str, icd_input) -> tuple:
     """
     icd_input: 'A09,B18' veya ['A09','B18'] olabilir.
-    Dönüş: (yg, bolum, icd_list_norm, key)
+    Dönüş: (yg, bolum, icd_list_norm, key)  -- yg/bolum train'deki kanonik değerlerine eşlenir.
     """
-    yg = str(yas_grup or "").strip()
-    b  = str(bolum or "").strip()
+    yg_in = str(yas_grup or "").strip()
+    b_in  = str(bolum or "").strip()
+    yg, b = canon_demo(yg_in, b_in)  # <--- kritik: kanonik demo
+
     if isinstance(icd_input, str):
         parts = [clean_icd(p) for p in re.split(r"[;,]", icd_input) if p.strip()]
     elif isinstance(icd_input, (list, tuple, set)):
@@ -780,14 +793,13 @@ def tahmin_et(icd_list, bolum=None, yas_grup=None):
     parts = sorted(set([p for p in parts if p]))
     key = "||".join(parts)
 
-    yg = (yas_grup or "").strip()
-    b  = (bolum or "").strip()
+    yg, b = canon_demo((yas_grup or "").strip(), (bolum or "").strip())  # <--- kanonik
 
     pred_rule, meta = predict_one(yg, b, key)
     p_plain, p_log, p_ens = xgb_predict_ens(yg, b, key, parts)
 
     if STRICT_SHORT_CIRCUIT and meta.get("SHORT_CIRCUIT", False):
-        pred_out = float(pred_rule)                       # anchor P50
+        pred_out = float(pred_rule)   # anchor P50
     else:
         if (p_ens is None) or (not np.isfinite(p_ens)) or (XGB_RULE_BLEND is None):
             pred_out = float(pred_rule)
