@@ -44,7 +44,6 @@ RANDOM_SEED = 42
 TOPK_ICD = 400
 MIN_SUPPORT = 1
 
-# ---> valid'de 3D görebilmek için satır-bazlı split
 SPLIT_BY_COMBO = False   # False: row-split (valid'de 3D mümkün)
 
 SATURATION_ON = True
@@ -78,18 +77,12 @@ XGB_PARAMS = dict(
 STRICT_SHORT_CIRCUIT = True
 # ====================================================
 
-__all__ = [
-    "tahmin_et",
-    "app_predict",
-    "app_predict_many",
-    "app_info",
-]
+__all__ = ["tahmin_et","app_predict","app_predict_many","app_info"]
 
 def stage(msg): print(f"[STAGE] {msg}", flush=True)
 
 # ---------- yardımcılar ----------
 def _norm_text_basic(s: str) -> str:
-    """Unicode -> aksan temizle -> boşluk sıkıştır -> lower"""
     if s is None: return ""
     s = unicodedata.normalize("NFKD", str(s))
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
@@ -231,10 +224,9 @@ df["ICD_Text_Embed"] = df[base_text_col].map(clean_text_anywhere_tags).fillna(""
 df["Yaş_Yıl_Int"] = pd.to_numeric(df["Yaş"], errors="coerce").round().astype("Int64")
 df["YaşGrup"] = df["Yaş"].apply(yas_to_group)
 
-# --- Demo kanonik sözlükleri (tam eşleşme garantisi için) ---
+# --- Demo kanonik sözlükleri ---
 YG_UNIQ = { _norm_text_basic(v): v for v in df["YaşGrup"].dropna().astype(str).unique() }
 BOLUM_UNIQ = { _norm_text_basic(v): v for v in df["Bölüm"].dropna().astype(str).unique() }
-
 def canon_demo(yas_grup: str, bolum: str) -> tuple[str,str]:
     yg = YG_UNIQ.get(_norm_text_basic(yas_grup), str(yas_grup or "").strip())
     b  = BOLUM_UNIQ.get(_norm_text_basic(bolum), str(bolum or "").strip())
@@ -242,7 +234,6 @@ def canon_demo(yas_grup: str, bolum: str) -> tuple[str,str]:
 
 # ================== 2) TRAIN/VALID SPLIT ==================
 stage("Train/Valid ayrımı")
-# ComboID sadece bilgi amaçlı
 df["ComboID"] = df["YaşGrup"].astype(str)+"||"+df["Bölüm"].astype(str)+"||"+df["ICD_Set_Key"].astype(str)
 
 if SPLIT_BY_COMBO:
@@ -268,44 +259,29 @@ if WINSORIZE_ON:
     stage(f"Winsorize (train) - p{int(WINSOR_LO*100)} / p{int(WINSOR_HI*100)}")
     train_df["Yatış Gün Sayısı"] = _winsorize_series(train_df["Yatış Gün Sayısı"], WINSOR_LO, WINSOR_HI)
 
-# ================== 3) LOOKUP TABLOLARI (train) ==================
-stage("Lookup tabloları (train)")
+# ================== 3) LOOKUP TABLOLARI ==================
+stage("Lookup tabloları (train + full)")
 
-# named-agg ile stabil toplulaştırma
-lkp3 = (
-    train_df
-    .groupby(["YaşGrup","Bölüm","ICD_Set_Key"], as_index=False)
-    .agg(
-        N=("Yatış Gün Sayısı","count"),
-        Ortalama=("Yatış Gün Sayısı", lambda x: round_half_up(x.mean())),
-        P50=("Yatış Gün Sayısı","median"),
-        P90=("Yatış Gün Sayısı", p90),
-    )
-)
+# ---- TRAIN lookuplar
+lkp3 = (train_df.groupby(["YaşGrup","Bölüm","ICD_Set_Key"], as_index=False)
+        .agg(N=("Yatış Gün Sayısı","count"),
+             Ortalama=("Yatış Gün Sayısı", lambda x: round_half_up(x.mean())),
+             P50=("Yatış Gün Sayısı","median"),
+             P90=("Yatış Gün Sayısı", p90)))
 lkp3["ICD_Set_Key"] = lkp3["ICD_Set_Key"].apply(clean_icd_set_key)
 
-lkp2 = (
-    train_df
-    .groupby(["Bölüm","ICD_Set_Key"], as_index=False)
-    .agg(
-        N=("Yatış Gün Sayısı","count"),
-        Ortalama=("Yatış Gün Sayısı", lambda x: round_half_up(x.mean())),
-        P50=("Yatış Gün Sayısı","median"),
-        P90=("Yatış Gün Sayısı", p90),
-    )
-)
+lkp2 = (train_df.groupby(["Bölüm","ICD_Set_Key"], as_index=False)
+        .agg(N=("Yatış Gün Sayısı","count"),
+             Ortalama=("Yatış Gün Sayısı", lambda x: round_half_up(x.mean())),
+             P50=("Yatış Gün Sayısı","median"),
+             P90=("Yatış Gün Sayısı", p90)))
 lkp2["ICD_Set_Key"] = lkp2["ICD_Set_Key"].apply(clean_icd_set_key)
 
-lkp1 = (
-    train_df
-    .groupby(["ICD_Set_Key"], as_index=False)
-    .agg(
-        N=("Yatış Gün Sayısı","count"),
-        Ortalama=("Yatış Gün Sayısı", lambda x: round_half_up(x.mean())),
-        P50=("Yatış Gün Sayısı","median"),
-        P90=("Yatış Gün Sayısı", p90),
-    )
-)
+lkp1 = (train_df.groupby(["ICD_Set_Key"], as_index=False)
+        .agg(N=("Yatış Gün Sayısı","count"),
+             Ortalama=("Yatış Gün Sayısı", lambda x: round_half_up(x.mean())),
+             P50=("Yatış Gün Sayısı","median"),
+             P90=("Yatış Gün Sayısı", p90)))
 lkp1["ICD_Set_Key"] = lkp1["ICD_Set_Key"].apply(clean_icd_set_key)
 
 lkp0 = pd.DataFrame({
@@ -315,12 +291,27 @@ lkp0 = pd.DataFrame({
     "P90": [train_df["Yatış Gün Sayısı"].quantile(0.9)]
 })
 
-# Tekil ICD P50 (global)
+# ---- FULL lookuplar (birebir short-circuit garanti için)
+lkp3_full = (df.groupby(["YaşGrup","Bölüm","ICD_Set_Key"], as_index=False)
+             .agg(N=("Yatış Gün Sayısı","count"),
+                  P50=("Yatış Gün Sayısı","median")))
+lkp3_full["ICD_Set_Key"] = lkp3_full["ICD_Set_Key"].apply(clean_icd_set_key)
+
+lkp2_full = (df.groupby(["Bölüm","ICD_Set_Key"], as_index=False)
+             .agg(N=("Yatış Gün Sayısı","count"),
+                  P50=("Yatış Gün Sayısı","median")))
+lkp2_full["ICD_Set_Key"] = lkp2_full["ICD_Set_Key"].apply(clean_icd_set_key)
+
+lkp1_full = (df.groupby(["ICD_Set_Key"], as_index=False)
+             .agg(N=("Yatış Gün Sayısı","count"),
+                  P50=("Yatış Gün Sayısı","median")))
+lkp1_full["ICD_Set_Key"] = lkp1_full["ICD_Set_Key"].apply(clean_icd_set_key)
+
+# Tekil / pair yardımcı tablolar (train)
 single = train_df[train_df["ICD_Sayısı"]==1].copy()
 single["ICD_Kod"] = single["ICD_List_Norm"].str[0]
 LKP_ICD = single.groupby("ICD_Kod")["Yatış Gün Sayısı"].agg(N="count", P50="median").reset_index()
 
-# İkili set P50
 pairs = train_df[train_df["ICD_Sayısı"]==2].copy()
 pairs["PairKey"] = pairs["ICD_List_Norm"].apply(lambda lst: "||".join(sorted(lst)))
 LKP_PAIR = pairs.groupby(["YaşGrup","Bölüm","PairKey"])["Yatış Gün Sayısı"].agg(N="count", P50="median").reset_index()
@@ -376,11 +367,14 @@ _present = [yg for yg in _age_order if yg in set(df["YaşGrup"].dropna().astype(
 DIM_YASGRUP = pd.DataFrame({"YaşGrup": _present})
 
 with pd.ExcelWriter(LOOKUP_XLSX, engine="xlsxwriter") as w:
-    lkp3.to_excel(w, index=False, sheet_name="LKP_3D_YasGrup")
-    lkp2.to_excel(w, index=False, sheet_name="LKP_2D")
-    lkp1.to_excel(w, index=False, sheet_name="LKP_1D")
-    lkp0.to_excel(w, index=False, sheet_name="LKP_0D")
-    LKP_ICD.to_excel(w, index=False, sheet_name="LKP_ICD")
+    lkp3.to_excel(w, index=False, sheet_name="LKP_3D_YasGrup_TRAIN")
+    lkp2.to_excel(w, index=False, sheet_name="LKP_2D_TRAIN")
+    lkp1.to_excel(w, index=False, sheet_name="LKP_1D_TRAIN")
+    lkp0.to_excel(w, index=False, sheet_name="LKP_0D_TRAIN")
+    lkp3_full.to_excel(w, index=False, sheet_name="LKP_3D_FULL")
+    lkp2_full.to_excel(w, index=False, sheet_name="LKP_2D_FULL")
+    lkp1_full.to_excel(w, index=False, sheet_name="LKP_1D_FULL")
+    LKP_ICD.to_excel(w, index=False, sheet_name="LKP_ICD_TRAIN")
     df[["ICD_Text_Embed"]].to_excel(w, index=False, sheet_name="TEXT_EMB_SOURCE")
     BR_ICDSET_MAP.to_excel(w, index=False, sheet_name="BR_ICDSET_MAP")
     DIM_ICD.to_excel(w, index=False, sheet_name="DIM_ICD")
@@ -389,11 +383,18 @@ print(f"OK -> {LOOKUP_XLSX}")
 
 # ================== 6) ANCHOR / PREDICT ==================
 stage("Prediction yardımcı yapılar")
+
+# TRAIN mapler
 lkp3_map = {(r["YaşGrup"], r["Bölüm"], r["ICD_Set_Key"]):(r["P50"], r["N"]) for _,r in lkp3.iterrows()}
 lkp2_map = {(r["Bölüm"], r["ICD_Set_Key"]):(r["P50"], r["N"]) for _,r in lkp2.iterrows()}
 lkp1_map = {r["ICD_Set_Key"]:(r["P50"], r["N"]) for _,r in lkp1.iterrows()}
 lkp0_p50 = float(lkp0["P50"].iloc[0]) if len(lkp0)>0 else 0.0
 lkp0_p90 = float(lkp0["P90"].iloc[0]) if len(lkp0)>0 else 0.0
+
+# FULL mapler (sadece exact-match short-circuit için)
+lkp3_full_map = {(r["YaşGrup"], r["Bölüm"], r["ICD_Set_Key"]):(r["P50"], r["N"]) for _,r in lkp3_full.iterrows()}
+lkp2_full_map = {(r["Bölüm"], r["ICD_Set_Key"]):(r["P50"], r["N"]) for _,r in lkp2_full.iterrows()}
+lkp1_full_map = {r["ICD_Set_Key"]:(r["P50"], r["N"]) for _,r in lkp1_full.iterrows()}
 
 ctx3_by_demo = defaultdict(list)
 for _, r in lkp3.iterrows():
@@ -405,7 +406,14 @@ for _, r in LKP_PAIR.iterrows():
 single_floor_map = dict(zip(LKP_ICD["ICD_Kod"], LKP_ICD["P50"]))
 
 def find_anchor(yg:str, bolum:str, key:str):
-    # Tam eşleşme -> kısa devre
+    # Önce FULL: exact-match varsa direkt short-circuit (P50)
+    if (yg, bolum, key) in lkp3_full_map:
+        p50, n = lkp3_full_map[(yg, bolum, key)]; return "3D", float(p50), n, key
+    if (bolum, key) in lkp2_full_map:
+        p50, n = lkp2_full_map[(bolum, key)];     return "2D", float(p50), n, key
+    if key in lkp1_full_map:
+        p50, n = lkp1_full_map[key];              return "1D", float(p50), n, key
+    # Sonra TRAIN (öğrenmede kullanılanlar)
     if (yg, bolum, key) in lkp3_map:
         p50, n = lkp3_map[(yg, bolum, key)]; return "3D", float(p50), n, key
     if (bolum, key) in lkp2_map:
@@ -478,7 +486,6 @@ def guardrails(yg:str, bolum:str, target_key:str, pred:float):
     return floor3
 
 def predict_one(yg:str, bolum:str, target_key:str):
-    # girişleri train'deki kanonik değerlere eşitle
     yg, bolum = canon_demo(yg, bolum)
 
     src, anchor_p50, n, anchor_key = find_anchor(yg, bolum, target_key)
@@ -490,7 +497,7 @@ def predict_one(yg:str, bolum:str, target_key:str):
                 "MODEL_PRED": float(anchor_p50), "PRED_BLEND": float(anchor_p50), "SHORT_CIRCUIT": True}
         return float(anchor_p50), meta
 
-    # Anchor bulunamadıysa komşu arama
+    # Anchor yoksa komşu
     if anchor_p50 is None:
         J, neigh_p50, neigh_key, neigh_src = nearest_neighbor_anchor(yg, bolum, target_key)
         anchor_p50, anchor_key, src, alpha = float(neigh_p50), neigh_key, f"NEIGHBOR_{neigh_src}", float(J)
@@ -557,9 +564,6 @@ if XGB_ENS_ON:
     def xgb_predict_ens(yg, bolum, key, icd_list_norm=None):
         if icd_list_norm is None:
             icd_list_norm = key.split("||") if key else []
-        df_one = pd.DataFrame({"Bölüm":[yg and bolum][0],"YaşGrup":[yg],
-                               "ICD_List_Norm":[icd_list_norm],"ICD_Sayısı":[len(icd_list_norm)]})
-        # Not: yukarıdaki satır sadece sütunları oluşturmak için; değerler önemlidir.
         df_one = pd.DataFrame({"Bölüm":[bolum],"YaşGrup":[yg],
                                "ICD_List_Norm":[icd_list_norm],"ICD_Sayısı":[len(icd_list_norm)]})
         X_one = _pack_features(df_one)
@@ -644,7 +648,7 @@ if TRUE_LOS_COL is None:
 
 n_3d_valid = 0
 for r in tqdm(valid_df.itertuples(), total=len(valid_df), desc="VALID_PREDICTIONS"):
-    yg, bol = canon_demo(r.YaşGrup, r.Bölüm)  # kanonik
+    yg, bol = canon_demo(r.YaşGrup, r.Bölüm)
     key = r.ICD_Set_Key
 
     if TRUE_LOS_COL is not None:
@@ -716,13 +720,9 @@ if "PRED_XGB_ENS" in valid_pred_df.columns:
 
 # ================== 11) APP KULLANIMI – FONKSİYONLAR ==================
 def app_normalize_inputs(yas_grup: str, bolum: str, icd_input) -> tuple:
-    """
-    icd_input: 'A09,B18' veya ['A09','B18'] olabilir.
-    Dönüş: (yg, bolum, icd_list_norm, key)  -- yg/bolum train'deki kanonik değerlerine eşlenir.
-    """
     yg_in = str(yas_grup or "").strip()
     b_in  = str(bolum or "").strip()
-    yg, b = canon_demo(yg_in, b_in)  # kritik: kanonik demo
+    yg, b = canon_demo(yg_in, b_in)
 
     if isinstance(icd_input, str):
         parts = [clean_icd(p) for p in re.split(r"[;,]", icd_input) if p.strip()]
@@ -735,9 +735,6 @@ def app_normalize_inputs(yas_grup: str, bolum: str, icd_input) -> tuple:
     return yg, b, parts, key
 
 def app_predict(yas_grup: str, bolum: str, icd_input):
-    """
-    Web/App katmanından tekil tahmin çağrısı.
-    """
     yg, b, parts, key = app_normalize_inputs(yas_grup, bolum, icd_input)
     pred_rule, meta = predict_one(yg, b, key)
 
@@ -789,12 +786,8 @@ def app_info():
         }
     }
 
-# ================== APP adapter (app.py'nin beklediği arayüz) ==================
+# ================== APP adapter ==================
 def tahmin_et(icd_list, bolum=None, yas_grup=None):
-    """
-    app.py -> /predict ve /predict_json bu fonksiyonu çağırır.
-    DÖNÜŞ: {"Pred_Final": float, "Pred_Final_Rounded": int}
-    """
     if isinstance(icd_list, str):
         icd_list = [s.strip() for s in icd_list.split(",") if s.strip()]
 
@@ -802,13 +795,13 @@ def tahmin_et(icd_list, bolum=None, yas_grup=None):
     parts = sorted(set([p for p in parts if p]))
     key = "||".join(parts)
 
-    yg, b = canon_demo((yas_grup or "").strip(), (bolum or "").strip())  # kanonik
+    yg, b = canon_demo((yas_grup or "").strip(), (bolum or "").strip())
 
     pred_rule, meta = predict_one(yg, b, key)
     p_plain, p_log, p_ens = xgb_predict_ens(yg, b, key, parts)
 
     if STRICT_SHORT_CIRCUIT and meta.get("SHORT_CIRCUIT", False):
-        pred_out = float(pred_rule)   # anchor P50
+        pred_out = float(pred_rule)
     else:
         if (p_ens is None) or (not np.isfinite(p_ens)) or (XGB_RULE_BLEND is None):
             pred_out = float(pred_rule)
@@ -816,8 +809,5 @@ def tahmin_et(icd_list, bolum=None, yas_grup=None):
             w = float(XGB_RULE_BLEND)
             pred_out = (1.0 - w) * float(pred_rule) + w * float(p_ens)
 
-    return {
-        "Pred_Final": float(pred_out),
-        "Pred_Final_Rounded": round_half_up(pred_out)
-    }
+    return {"Pred_Final": float(pred_out), "Pred_Final_Rounded": round_half_up(pred_out)}
 # ================== /APP adapter ==================
