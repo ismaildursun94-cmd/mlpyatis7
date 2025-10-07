@@ -1,14 +1,15 @@
+# app.py
 import os
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Request, Form
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Form
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, field_validator
-from proje import tahmin_et  # gerçek fonksiyon
+from proje import tahmin_et  # sadece Pred_Final_Rounded dönen fonksiyon
 
 app = FastAPI(title="LOS Predictor API", version="1.0.0")
 
 # -------------------------------
-# 1️⃣ API Modeli
+# 1) API Modeli (JSON istekleri için)
 # -------------------------------
 class PredictRequest(BaseModel):
     icd_list: List[str]
@@ -24,7 +25,7 @@ class PredictRequest(BaseModel):
 
 
 # -------------------------------
-# 2️⃣ Ana Sayfa (HTML Arayüz)
+# 2) Ana Sayfa (yalın arayüz)
 # -------------------------------
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -33,39 +34,42 @@ def index():
     <head>
         <title>LOS Predictor</title>
         <style>
-            body { font-family: Arial, sans-serif; max-width: 600px; margin: 40px auto; background: #fafafa; padding: 20px; border-radius: 10px; }
-            input, button { padding: 8px; margin-top: 8px; width: 100%; }
-            button { background: #007bff; color: white; border: none; cursor: pointer; font-weight: bold; }
-            button:hover { background: #0056b3; }
-            pre { background: #eee; padding: 10px; border-radius: 6px; }
+            body { font-family: Arial, sans-serif; max-width: 520px; margin: 40px auto;
+                   background: #fafafa; padding: 20px; border-radius: 10px; }
+            input, button { padding: 10px; margin-top: 8px; width: 100%; box-sizing: border-box; }
+            button { background: #0a66ff; color: #fff; border: none; cursor: pointer; font-weight: 600; }
+            button:hover { background: #084dcc; }
+            #result { font-size: 28px; font-weight: 700; margin-top: 14px; }
+            label { font-size: 12px; color: #333; }
         </style>
     </head>
     <body>
         <h2>LOS Tahmin Arayüzü</h2>
         <form id="predictForm">
             <label>ICD Listesi (virgülle):</label>
-            <input type="text" id="icd_list" name="icd_list" value="K11, A00.1">
+            <input type="text" id="icd_list" name="icd_list" value="K80.0">
 
-            <label>Bölüm:</label>
-            <input type="text" id="bolum" name="bolum" value="Kardiyoloji">
+            <label>Bölüm (ops.):</label>
+            <input type="text" id="bolum" name="bolum" placeholder="örn. Kardiyoloji">
 
-            <label>Yaş Grubu:</label>
-            <input type="text" id="yas_grup" name="yas_grup" value="0-1">
+            <label>Yaş Grubu (ops.):</label>
+            <input type="text" id="yas_grup" name="yas_grup" placeholder="örn. 0-1">
 
             <button type="submit">Tahmin Et</button>
         </form>
-        <h3>Sonuç:</h3>
-        <pre id="result">Henüz sorgulanmadı...</pre>
+
+        <div id="result"></div>
 
         <script>
         document.getElementById("predictForm").addEventListener("submit", async (e) => {
             e.preventDefault();
-            const icd = document.getElementById("icd_list").value.split(",").map(x => x.trim());
+            const icd = document.getElementById("icd_list").value.split(",").map(x => x.trim()).filter(x => x);
             const bolum = document.getElementById("bolum").value.trim();
-            const yas = document.getElementById("yas_grup").value.trim();
+            const yas   = document.getElementById("yas_grup").value.trim();
 
             const body = { icd_list: icd, bolum: bolum || null, yas_grup: yas || null };
-            document.getElementById("result").innerText = "Tahmin ediliyor...";
+            const resEl = document.getElementById("result");
+            resEl.textContent = "…";
 
             try {
                 const res = await fetch("/predict", {
@@ -73,10 +77,10 @@ def index():
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify(body)
                 });
-                const data = await res.json();
-                document.getElementById("result").innerText = JSON.stringify(data, null, 2);
+                const text = await res.text();   // sadece sayı dönüyor
+                resEl.textContent = text;
             } catch (err) {
-                document.getElementById("result").innerText = "Hata: " + err;
+                resEl.textContent = "Hata";
             }
         });
         </script>
@@ -86,7 +90,7 @@ def index():
 
 
 # -------------------------------
-# 3️⃣ Sağlık kontrolü (Render test)
+# 3) Sağlık kontrolü
 # -------------------------------
 @app.get("/health")
 def health():
@@ -94,18 +98,42 @@ def health():
 
 
 # -------------------------------
-# 4️⃣ Tahmin Endpoint
+# 4) Tahmin (JSON → düz metin sayı)
 # -------------------------------
-@app.post("/predict")
+@app.post("/predict", response_class=PlainTextResponse)
 def predict(req: PredictRequest):
     try:
-        return tahmin_et(req.icd_list, req.bolum, req.yas_grup)
+        out = tahmin_et(req.icd_list, req.bolum, req.yas_grup)
+        val = out.get("Pred_Final_Rounded", None)
+        if val is None:
+            raise RuntimeError("Pred_Final_Rounded üretilemedi.")
+        return str(val)  # sadece sayı
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Hata: {e}")
 
 
 # -------------------------------
-# 5️⃣ Çalıştırıcı
+# 5) Form-POST isteyenler için alternatif (opsiyonel)
+# -------------------------------
+@app.post("/tahmin", response_class=PlainTextResponse)
+def tahmin_form(
+    icd_text: str = Form(...),
+    bolum: Optional[str] = Form(None),
+    yas_grup: Optional[str] = Form(None),
+):
+    try:
+        icds = [s.strip() for s in icd_text.split(",") if s.strip()]
+        out = tahmin_et(icds, bolum, yas_grup)
+        val = out.get("Pred_Final_Rounded", None)
+        if val is None:
+            raise RuntimeError("Pred_Final_Rounded üretilemedi.")
+        return str(val)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Hata: {e}")
+
+
+# -------------------------------
+# 6) Çalıştırıcı
 # -------------------------------
 if __name__ == "__main__":
     import uvicorn

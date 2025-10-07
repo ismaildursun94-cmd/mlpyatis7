@@ -942,7 +942,7 @@ def _to_icd_key(icd_list):
 def tahmin_et(icd_list, bolum=None, yas_grup=None):
     """
     Dış API'den çağrılacak tek giriş noktası.
-    3D→2D→1D kuralı + (varsa) XGB ens harmanı.
+    Sadece Pred_Final_Rounded değeri döndürür.
     """
     if not icd_list or not isinstance(icd_list, (list, tuple, set)):
         raise ValueError("icd_list boş olamaz")
@@ -967,11 +967,5 @@ def tahmin_et(icd_list, bolum=None, yas_grup=None):
     else:
         pred_out = (1.0 - w) * float(pred_rule) + w * float(p_ens)
 
-    return {
-        "ok": True,
-        "P50": round_half_up(pred_out),  # = Pred_Final_Rounded
-        "P25": None,
-        "P75": None,
-        "source": str(meta.get("ANCHOR_SRC", "")),
-        "debug": json.dumps(meta, ensure_ascii=False),
-    }
+    # Sadece Pred_Final_Rounded döndür
+    return {"Pred_Final_Rounded": round_half_up(pred_out)}
