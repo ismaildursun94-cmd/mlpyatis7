@@ -976,11 +976,7 @@ def tahmin_et(icd_list, bolum=None, yas_grup=None):
     else:
         pred_out = (1.0 - w) * float(pred_rule) + w * float(p_ens)
 
-    return {
-        "ok": True,
-        "P50": round_half_up(pred_out),
-        "P25": None,
-        "P75": None,
-        "source": str(meta.get("ANCHOR_SRC", "")),
-        "debug": json.dumps(meta, ensure_ascii=False)
-    }
+   return {
+    "ok": True,
+    "Pred_Final_Rounded": round_half_up(pred_out)
+}
