@@ -44,8 +44,8 @@ RANDOM_SEED = 42
 TOPK_ICD = 400
 MIN_SUPPORT = 1
 
-# ---> YENİ: valid'de 3D görebilmek için satır-bazlı split seçeneği
-SPLIT_BY_COMBO = False   # False: row-split (valid'de 3D olabilir), True: combo-split (valid'de 3D olmaz)
+# ---> valid'de 3D görebilmek için satır-bazlı split
+SPLIT_BY_COMBO = False   # False: row-split (valid'de 3D mümkün)
 
 SATURATION_ON = True
 SATURATION_K = 3.0
@@ -77,6 +77,13 @@ XGB_PARAMS = dict(
 
 STRICT_SHORT_CIRCUIT = True
 # ====================================================
+
+__all__ = [
+    "tahmin_et",
+    "app_predict",
+    "app_predict_many",
+    "app_info",
+]
 
 def stage(msg): print(f"[STAGE] {msg}", flush=True)
 
@@ -247,7 +254,7 @@ stage("Lookup tabloları (train)")
 def _lkp_stats(g):
     return g["Yatış Gün Sayısı"].agg(N="count", Ortalama=lambda x: round_half_up(x.mean()), P50="median", P90=p90)
 
-# >>> FutureWarning düzeltmesi: group_keys=False
+# FutureWarning fix: group_keys=False
 lkp3 = train_df.groupby(["YaşGrup", "Bölüm", "ICD_Set_Key"], group_keys=False).apply(_lkp_stats).reset_index()
 lkp3["ICD_Set_Key"] = lkp3["ICD_Set_Key"].apply(clean_icd_set_key)
 
@@ -427,12 +434,14 @@ def guardrails(yg:str, bolum:str, target_key:str, pred:float):
 
 def predict_one(yg:str, bolum:str, target_key:str):
     src, anchor_p50, n, anchor_key = find_anchor(yg, bolum, target_key)
+    # 3D/2D/1D birebir eşleşme → short-circuit
     if anchor_p50 is not None and anchor_key == target_key and src in ("3D","2D","1D"):
         meta = {"ANCHOR_SRC": src, "ANCHOR_KEY": anchor_key or "", "ANCHOR_P50": float(anchor_p50),
                 "ALPHA_JACCARD": 0.0, "ADDED_ICDS": "", "BETA_SUM": 0.0, "GAMMA_SUM": 0.0,
                 "MODEL_PRED": float(anchor_p50), "PRED_BLEND": float(anchor_p50), "SHORT_CIRCUIT": True}
         return float(anchor_p50), meta
 
+    # Anchor bulunamadıysa komşu arama
     if anchor_p50 is None:
         J, neigh_p50, neigh_key, neigh_src = nearest_neighbor_anchor(yg, bolum, target_key)
         anchor_p50, anchor_key, src, alpha = float(neigh_p50), neigh_key, f"NEIGHBOR_{neigh_src}", float(J)
@@ -447,7 +456,8 @@ def predict_one(yg:str, bolum:str, target_key:str):
 
     cap_ref = demop90_map.get((yg, bolum), lkp0_p90)
     cap_val = float(cap_ref) * float(CAP_MARJ) if cap_ref is not None else float("inf")
-    if cap_val is not None: pred_final = min(float(pred_final), float(cap_val))
+    if cap_val is not None:
+        pred_final = min(float(pred_final), float(cap_val))
 
     meta = {"ANCHOR_SRC": src, "ANCHOR_KEY": anchor_key or "", "ANCHOR_P50": float(anchor_p50),
             "ALPHA_JACCARD": float(alpha), "ADDED_ICDS": ",".join(added_icds),
@@ -653,7 +663,7 @@ if "PRED_XGB_ENS" in valid_pred_df.columns:
 # ================== 11) APP KULLANIMI – FONKSİYONLAR ==================
 def app_normalize_inputs(yas_grup: str, bolum: str, icd_input) -> tuple:
     """
-    icd_input: 'A09,B18' gibi string veya ['A09','B18'] listesi olabilir.
+    icd_input: 'A09,B18' veya ['A09','B18'] olabilir.
     Dönüş: (yg, bolum, icd_list_norm, key)
     """
     yg = str(yas_grup or "").strip()
@@ -671,7 +681,6 @@ def app_normalize_inputs(yas_grup: str, bolum: str, icd_input) -> tuple:
 def app_predict(yas_grup: str, bolum: str, icd_input):
     """
     Web/App katmanından tekil tahmin çağrısı.
-    Döndürdükleri JSON-dostu: skorlar + meta.
     """
     yg, b, parts, key = app_normalize_inputs(yas_grup, bolum, icd_input)
     pred_rule, meta = predict_one(yg, b, key)
@@ -700,13 +709,6 @@ def app_predict(yas_grup: str, bolum: str, icd_input):
     }
 
 def app_predict_many(records):
-    """
-    Toplu çağrı: records = [
-      {"yas_grup": "35-50", "bolum": "Dahiliye", "icd": "A09,B18"},
-      {"yas_grup": "0-1",   "bolum": "Kardiyoloji", "icd": ["K11","J18"]},
-      ...
-    ]
-    """
     out = []
     for rec in records:
         yg = rec.get("yas_grup", "")
@@ -716,9 +718,6 @@ def app_predict_many(records):
     return out
 
 def app_info():
-    """
-    Servis sağlığı / konfig bilgisi vb.
-    """
     return {
         "created_at": datetime.datetime.now().isoformat(),
         "winsorize_on": bool(WINSORIZE_ON),
@@ -733,7 +732,6 @@ def app_info():
             "gamma_pairs": len(gamma_pairs),
         }
     }
-# ================== /APP FONKSİYONLARI ==================
 
 # ================== APP adapter (app.py'nin beklediği arayüz) ==================
 def tahmin_et(icd_list, bolum=None, yas_grup=None):
@@ -741,11 +739,9 @@ def tahmin_et(icd_list, bolum=None, yas_grup=None):
     app.py -> /predict ve /predict_json bu fonksiyonu çağırır.
     DÖNÜŞ: {"Pred_Final": float, "Pred_Final_Rounded": int}
     """
-    # ICD girişi string ise listeye çevir
     if isinstance(icd_list, str):
         icd_list = [s.strip() for s in icd_list.split(",") if s.strip()]
 
-    # Normalize et → "ICD_Set_Key" (clean + strip + UPPER + sorted + '||')
     parts = [clean_icd(x) for x in icd_list if str(x).strip()]
     parts = sorted(set([p for p in parts if p]))
     key = "||".join(parts)
@@ -753,16 +749,11 @@ def tahmin_et(icd_list, bolum=None, yas_grup=None):
     yg = (yas_grup or "").strip()
     b  = (bolum or "").strip()
 
-    # 1) Kural tabanlı tahmin (short-circuit içerir)
     pred_rule, meta = predict_one(yg, b, key)
+    p_plain, p_log, p_ens = xgb_predict_ens(yg, b, key, parts)
 
-    # 2) XGB ens tahmini (varsa)
-    icd_list_norm = parts
-    p_plain, p_log, p_ens = xgb_predict_ens(yg, b, key, icd_list_norm)
-
-    # 3) Nihai çıktı (short-circuit ve harmanlama)
     if STRICT_SHORT_CIRCUIT and meta.get("SHORT_CIRCUIT", False):
-        pred_out = float(pred_rule)
+        pred_out = float(pred_rule)                       # anchor P50
     else:
         if (p_ens is None) or (not np.isfinite(p_ens)) or (XGB_RULE_BLEND is None):
             pred_out = float(pred_rule)
