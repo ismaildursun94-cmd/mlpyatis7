@@ -231,7 +231,6 @@ else:
     idx_train, idx_valid = train_test_split(df.index, test_size=0.2, random_state=RANDOM_SEED)
     train_df = df.loc[idx_train].copy()
     valid_df = df.loc[idx_valid].copy()
-    # rapor
     _overlap_rate = (valid_df["ComboID"].isin(train_df["ComboID"].unique())).mean()
     print(f"Valid satırlarının train ile ComboID örtüşme oranı: {_overlap_rate:.2%}")
 
@@ -248,13 +247,14 @@ stage("Lookup tabloları (train)")
 def _lkp_stats(g):
     return g["Yatış Gün Sayısı"].agg(N="count", Ortalama=lambda x: round_half_up(x.mean()), P50="median", P90=p90)
 
-lkp3 = train_df.groupby(["YaşGrup", "Bölüm", "ICD_Set_Key"]).apply(_lkp_stats).reset_index()
+# >>> FutureWarning düzeltmesi: group_keys=False
+lkp3 = train_df.groupby(["YaşGrup", "Bölüm", "ICD_Set_Key"], group_keys=False).apply(_lkp_stats).reset_index()
 lkp3["ICD_Set_Key"] = lkp3["ICD_Set_Key"].apply(clean_icd_set_key)
 
-lkp2 = train_df.groupby(["Bölüm", "ICD_Set_Key"]).apply(_lkp_stats).reset_index()
+lkp2 = train_df.groupby(["Bölüm", "ICD_Set_Key"], group_keys=False).apply(_lkp_stats).reset_index()
 lkp2["ICD_Set_Key"] = lkp2["ICD_Set_Key"].apply(clean_icd_set_key)
 
-lkp1 = train_df.groupby(["ICD_Set_Key"]).apply(_lkp_stats).reset_index()
+lkp1 = train_df.groupby(["ICD_Set_Key"], group_keys=False).apply(_lkp_stats).reset_index()
 lkp1["ICD_Set_Key"] = lkp1["ICD_Set_Key"].apply(clean_icd_set_key)
 
 lkp0 = pd.DataFrame({
@@ -524,7 +524,9 @@ for r in tqdm(uniq_combos_df.itertuples(), total=len(uniq_combos_df), desc="PRED
             pred_final_out = (1.0 - w) * float(pred_rule) + w * float(p_ens)
     pred_rows.append({
         "YaşGrup": r.YaşGrup, "Bölüm": r.Bölüm, "ICD_Set_Key": r.ICD_Set_Key,
-        "Pred_Final": round_half_up(pred_final_out), "PRED_RULE": float(pred_rule),
+        "Pred_Final": float(pred_final_out),
+        "Pred_Final_Rounded": round_half_up(pred_final_out),
+        "PRED_RULE": float(pred_rule),
         "PRED_XGB_PLAIN": float(p_plain) if pd.notna(p_plain) else np.nan,
         "PRED_XGB_LOG": float(p_log) if pd.notna(p_log) else np.nan,
         "PRED_XGB_ENS": float(p_ens) if pd.notna(p_ens) else np.nan, **meta
@@ -565,7 +567,7 @@ stage("VALID_PREDICTIONS.xlsx üretiliyor (valid set)")
 valid_rows=[]
 
 def _norm_col(s: str) -> str:
-    s = unicodedata.normalize("NFKD", s); s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = unicodedata.normalize("NFKD", s); s = "".join(ch for ch in s if not s or not unicodedata.combining(ch))
     s = s.lower(); s = re.sub(r"\s+", "_", s); s = re.sub(r"[^a-z0-9_]+", "_", s)
     return s.strip("_")
 
@@ -588,7 +590,7 @@ for r in tqdm(valid_df.itertuples(), total=len(valid_df), desc="VALID_PREDICTION
         true_los = np.nan
 
     pred_rule, meta = predict_one(yg, bol, key)
-    if meta.get("ANCHOR_SRC")=="3D": n_3d_valid += 1  # sayaç
+    if meta.get("ANCHOR_SRC")=="3D": n_3d_valid += 1
 
     icd_list_norm = key.split("||") if isinstance(key, str) and key else []
     p_plain, p_log, p_ens = xgb_predict_ens(yg, bol, key, icd_list_norm)
@@ -654,8 +656,8 @@ def app_normalize_inputs(yas_grup: str, bolum: str, icd_input) -> tuple:
     icd_input: 'A09,B18' gibi string veya ['A09','B18'] listesi olabilir.
     Dönüş: (yg, bolum, icd_list_norm, key)
     """
-    yg = str(yas_grup).strip()
-    b  = str(bolum).strip()
+    yg = str(yas_grup or "").strip()
+    b  = str(bolum or "").strip()
     if isinstance(icd_input, str):
         parts = [clean_icd(p) for p in re.split(r"[;,]", icd_input) if p.strip()]
     elif isinstance(icd_input, (list, tuple, set)):
@@ -683,7 +685,6 @@ def app_predict(yas_grup: str, bolum: str, icd_input):
         else:
             pred_out = (1.0 - float(XGB_RULE_BLEND)) * float(pred_rule) + float(XGB_RULE_BLEND) * float(p_ens)
 
-    # Nihai guardrails (cap) zaten predict_one içinde uygulanıyor; burada sadece yuvarlanmış çıktı ekliyoruz.
     return {
         "yas_grup": yg,
         "bolum": b,
@@ -744,7 +745,7 @@ def tahmin_et(icd_list, bolum=None, yas_grup=None):
     if isinstance(icd_list, str):
         icd_list = [s.strip() for s in icd_list.split(",") if s.strip()]
 
-    # Normalize et → "ICD_Set_Key"
+    # Normalize et → "ICD_Set_Key" (clean + strip + UPPER + sorted + '||')
     parts = [clean_icd(x) for x in icd_list if str(x).strip()]
     parts = sorted(set([p for p in parts if p]))
     key = "||".join(parts)
