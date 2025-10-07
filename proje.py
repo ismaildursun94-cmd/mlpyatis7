@@ -733,3 +733,44 @@ def app_info():
         }
     }
 # ================== /APP FONKSİYONLARI ==================
+
+# ================== APP adapter (app.py'nin beklediği arayüz) ==================
+def tahmin_et(icd_list, bolum=None, yas_grup=None):
+    """
+    app.py -> /predict ve /predict_json bu fonksiyonu çağırır.
+    DÖNÜŞ: {"Pred_Final": float, "Pred_Final_Rounded": int}
+    """
+    # ICD girişi string ise listeye çevir
+    if isinstance(icd_list, str):
+        icd_list = [s.strip() for s in icd_list.split(",") if s.strip()]
+
+    # Normalize et → "ICD_Set_Key"
+    parts = [clean_icd(x) for x in icd_list if str(x).strip()]
+    parts = sorted(set([p for p in parts if p]))
+    key = "||".join(parts)
+
+    yg = (yas_grup or "").strip()
+    b  = (bolum or "").strip()
+
+    # 1) Kural tabanlı tahmin (short-circuit içerir)
+    pred_rule, meta = predict_one(yg, b, key)
+
+    # 2) XGB ens tahmini (varsa)
+    icd_list_norm = parts
+    p_plain, p_log, p_ens = xgb_predict_ens(yg, b, key, icd_list_norm)
+
+    # 3) Nihai çıktı (short-circuit ve harmanlama)
+    if STRICT_SHORT_CIRCUIT and meta.get("SHORT_CIRCUIT", False):
+        pred_out = float(pred_rule)
+    else:
+        if (p_ens is None) or (not np.isfinite(p_ens)) or (XGB_RULE_BLEND is None):
+            pred_out = float(pred_rule)
+        else:
+            w = float(XGB_RULE_BLEND)
+            pred_out = (1.0 - w) * float(pred_rule) + w * float(p_ens)
+
+    return {
+        "Pred_Final": float(pred_out),
+        "Pred_Final_Rounded": round_half_up(pred_out)
+    }
+# ================== /APP adapter ==================

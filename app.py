@@ -4,6 +4,8 @@ from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Form
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, field_validator
+from proje import tahmin_et
+
 
 # Tahmin adapter'ı (proje.py içinde tanımlı olmalı)
 from proje import tahmin_et  # Pred_Final_Rounded dönen dict bekleniyor
