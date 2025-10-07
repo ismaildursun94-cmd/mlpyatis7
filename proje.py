@@ -942,15 +942,7 @@ def _to_icd_key(icd_list):
 def tahmin_et(icd_list, bolum=None, yas_grup=None):
     """
     Dış API'den çağrılacak tek giriş noktası.
-    3D→2D→1D (0D kapalı) kural + (varsa) XGB ens ile harmanlı P50 döndürür.
-
-    Parametreler:
-      - icd_list: ["K11","A00.1", ...]
-      - bolum: "Kardiyoloji" (opsiyonel; boşsa train moda)
-      - yas_grup: "0-1","2-5",...,"65+" (opsiyonel; boşsa train moda)
-
-    Dönüş:
-      {"ok": True, "P50": int, "P25": None, "P75": None, "source": str, "debug": str}
+    3D→2D→1D kuralı + (varsa) XGB ens harmanı.
     """
     if not icd_list or not isinstance(icd_list, (list, tuple, set)):
         raise ValueError("icd_list boş olamaz")
@@ -962,21 +954,24 @@ def tahmin_et(icd_list, bolum=None, yas_grup=None):
     yg = yas_grup if (yas_grup and str(yas_grup).strip()) else DEFAULT_YG
     bol = bolum if (bolum and str(bolum).strip()) else DEFAULT_BOLUM
 
-    # Kural tabanlı
+    # Kural tabanlı tahmin
     pred_rule, meta = predict_one(yg, bol, key)
 
     # XGB (varsa)
     icd_list_norm = key.split("||") if key else []
     p_plain, p_log, p_ens = xgb_predict_ens(yg, bol, key, icd_list_norm)
 
-    _v = globals().get("XGB_RULE_BLEND")
-    w = 0.5 if _v is None else float(_v)
+    w = 0.5 if globals().get("XGB_RULE_BLEND") is None else float(XGB_RULE_BLEND)
     if (p_ens is None) or (not np.isfinite(p_ens)):
         pred_out = float(pred_rule)
     else:
         pred_out = (1.0 - w) * float(pred_rule) + w * float(p_ens)
 
-   return {
-    "ok": True,
-    "Pred_Final_Rounded": round_half_up(pred_out)
-}
+    return {
+        "ok": True,
+        "P50": round_half_up(pred_out),  # = Pred_Final_Rounded
+        "P25": None,
+        "P75": None,
+        "source": str(meta.get("ANCHOR_SRC", "")),
+        "debug": json.dumps(meta, ensure_ascii=False),
+    }
