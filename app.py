@@ -4,13 +4,37 @@ from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Form
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, field_validator
-from proje import tahmin_et  # sadece Pred_Final_Rounded dönen fonksiyon
 
+# Tahmin adapter'ı (proje.py içinde tanımlı olmalı)
+from proje import tahmin_et  # Pred_Final_Rounded dönen dict bekleniyor
+
+# (opsiyonel) info endpoint'i için dene; yoksa None kalsın
+try:
+    from proje import app_info as _app_info
+except Exception:
+    _app_info = None
+
+# -------------------------------------------------
+# FastAPI uygulaması
+# -------------------------------------------------
 app = FastAPI(title="LOS Predictor API", version="1.0.0")
 
-# -------------------------------
+# (Opsiyonel) CORS - gerekirse domainleri kısıtla
+try:
+    from fastapi.middleware.cors import CORSMiddleware
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],   # prod'da kendi domaininle sınırla
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+except Exception:
+    pass
+
+# -------------------------------------------------
 # 1) API Modeli (JSON istekleri için)
-# -------------------------------
+# -------------------------------------------------
 class PredictRequest(BaseModel):
     icd_list: List[str]
     bolum: Optional[str] = None
@@ -23,24 +47,25 @@ class PredictRequest(BaseModel):
             raise ValueError("icd_list boş olamaz")
         return [s.strip() for s in v if s and s.strip()]
 
-
-# -------------------------------
+# -------------------------------------------------
 # 2) Ana Sayfa (yalın arayüz)
-# -------------------------------
+# -------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 def index():
     return """
     <html>
     <head>
         <title>LOS Predictor</title>
+        <meta charset="utf-8" />
         <style>
-            body { font-family: Arial, sans-serif; max-width: 520px; margin: 40px auto;
-                   background: #fafafa; padding: 20px; border-radius: 10px; }
+            body { font-family: Arial, sans-serif; max-width: 540px; margin: 40px auto;
+                   background: #fafafa; padding: 20px; border-radius: 12px; }
             input, button { padding: 10px; margin-top: 8px; width: 100%; box-sizing: border-box; }
             button { background: #0a66ff; color: #fff; border: none; cursor: pointer; font-weight: 600; }
             button:hover { background: #084dcc; }
             #result { font-size: 28px; font-weight: 700; margin-top: 14px; }
             label { font-size: 12px; color: #333; }
+            .hint { font-size: 12px; color: #666; margin-top: 6px; }
         </style>
     </head>
     <body>
@@ -58,6 +83,7 @@ def index():
             <button type="submit">Tahmin Et</button>
         </form>
 
+        <div class="hint">/predict uç noktası sadece sayı döndürür. Tam JSON için /predict_json kullan.</div>
         <div id="result"></div>
 
         <script>
@@ -77,6 +103,11 @@ def index():
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify(body)
                 });
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({}));
+                    resEl.textContent = "Hata: " + (err.detail || res.statusText);
+                    return;
+                }
                 const text = await res.text();   // sadece sayı dönüyor
                 resEl.textContent = text;
             } catch (err) {
@@ -88,18 +119,25 @@ def index():
     </html>
     """
 
-
-# -------------------------------
-# 3) Sağlık kontrolü
-# -------------------------------
+# -------------------------------------------------
+# 3) Sağlık / bilgi
+# -------------------------------------------------
 @app.get("/health")
 def health():
     return {"status": "up", "service": "los-predictor", "version": "1.0.0"}
 
+@app.get("/info")
+def info():
+    if callable(_app_info):
+        try:
+            return _app_info()
+        except Exception as e:
+            return {"error": f"app_info çağrısı başarısız: {type(e).__name__}: {e}"}
+    return {"info": "app_info tanımlı değil (proje.app_info bulunamadı)."}
 
-# -------------------------------
+# -------------------------------------------------
 # 4) Tahmin (JSON → düz metin sayı)
-# -------------------------------
+# -------------------------------------------------
 @app.post("/predict", response_class=PlainTextResponse)
 def predict(req: PredictRequest):
     try:
@@ -107,14 +145,24 @@ def predict(req: PredictRequest):
         val = out.get("Pred_Final_Rounded", None)
         if val is None:
             raise RuntimeError("Pred_Final_Rounded üretilemedi.")
-        return str(val)  # sadece sayı
+        return str(int(val))  # sadece sayı
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Hata: {e}")
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
+# -------------------------------------------------
+# 5) Tam JSON isteyenler için alternatif
+# -------------------------------------------------
+@app.post("/predict_json")
+def predict_json(req: PredictRequest):
+    try:
+        out = tahmin_et(req.icd_list, req.bolum, req.yas_grup)
+        return out
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
-# -------------------------------
-# 5) Form-POST isteyenler için alternatif (opsiyonel)
-# -------------------------------
+# -------------------------------------------------
+# 6) Form-POST isteyenler için alternatif (opsiyonel)
+# -------------------------------------------------
 @app.post("/tahmin", response_class=PlainTextResponse)
 def tahmin_form(
     icd_text: str = Form(...),
@@ -127,14 +175,13 @@ def tahmin_form(
         val = out.get("Pred_Final_Rounded", None)
         if val is None:
             raise RuntimeError("Pred_Final_Rounded üretilemedi.")
-        return str(val)
+        return str(int(val))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Hata: {e}")
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
-
-# -------------------------------
-# 6) Çalıştırıcı
-# -------------------------------
+# -------------------------------------------------
+# 7) Çalıştırıcı (Render PORT değişkenini kullanır)
+# -------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "10000"))
