@@ -1,15 +1,38 @@
 # app.py
 import os
-from typing import List, Optional, Union
-from fastapi import FastAPI, HTTPException, Form
-from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
-from pydantic import BaseModel, field_validator
 import re
+from typing import List, Optional, Union
 
-# proje.py'den adapter + debug amaçlı zengin JSON dönen fonksiyonları alıyoruz
+from fastapi import FastAPI, HTTPException, Form
+from fastapi.responses import (
+    HTMLResponse,
+    PlainTextResponse,
+    JSONResponse,
+    FileResponse,
+)
+from pydantic import BaseModel, field_validator
+
+# proje.py'den tahmin fonksiyonları ve dosya adları
 from proje import tahmin_et, app_predict, app_info
 
-app = FastAPI(title="LOS Predictor API", version="1.1.1")
+# Bu değişkenler proje.py'de global; import başarısızsa varsayılanlara düşeceğiz
+try:
+    from proje import (
+        LOOKUP_XLSX,
+        PRED_LOS_XLSX,
+        VALID_PRED_XLSX,
+        YENI_VAKALAR_XLSX,
+        MODEL_DIR,
+    )
+except Exception:
+    LOOKUP_XLSX = "LOS_Lookup_All.xlsx"
+    PRED_LOS_XLSX = "PRED_LOS.xlsx"
+    VALID_PRED_XLSX = "VALID_PREDICTIONS.xlsx"
+    YENI_VAKALAR_XLSX = "YeniVakalar.xlsx"
+    MODEL_DIR = "model_out"
+
+app = FastAPI(title="LOS Predictor API", version="1.2.0")
+
 
 # -------------------------------
 # 1) API Modeli (JSON istekleri için)
@@ -27,6 +50,7 @@ class PredictRequest(BaseModel):
         def split_any(s: str):
             s = re.sub(r"\|\|", "|", s or "")
             return [p.strip() for p in re.split(r"[,\;\|\s]+", s) if p and p.strip()]
+
         if isinstance(v, str):
             return split_any(v)
         elif isinstance(v, (list, tuple, set)):
@@ -48,6 +72,7 @@ class PredictRequest(BaseModel):
             raise ValueError("icd_list boş olamaz")
         return v
 
+
 # -------------------------------
 # 2) Ana Sayfa (yalın arayüz)
 # -------------------------------
@@ -68,6 +93,7 @@ def index():
             #result { font-size: 32px; font-weight: 800; margin-top: 16px; }
             label { font-size: 12px; color: #bbb; }
             small { color:#b9a97c }
+            a.dl { color:#9ad; text-decoration:none; }
         </style>
     </head>
     <body>
@@ -86,7 +112,18 @@ def index():
         </form>
 
         <div id="result"></div>
+
         <p><small>/predict sadece sayı döndürür. Tam JSON ve ANCHOR bilgileri için <code>POST /predict_json</code> kullan.</small></p>
+
+        <p>
+          <small>
+            Hızlı indirme: 
+            <a class="dl" href="/download/lookup">Lookup XLSX</a> ·
+            <a class="dl" href="/download/pred_los">PRED_LOS.xlsx</a> ·
+            <a class="dl" href="/download/valid">VALID_PREDICTIONS.xlsx</a> ·
+            <a class="dl" href="/download/yeni">YeniVakalar.xlsx</a>
+          </small>
+        </p>
 
         <script>
         function splitAny(s) {
@@ -129,12 +166,14 @@ def index():
     </html>
     """
 
+
 # -------------------------------
 # 3) Sağlık / bilgi
 # -------------------------------
 @app.get("/health")
 def health():
     return {"status": "up", "service": "los-predictor", "version": app.version}
+
 
 @app.get("/info", response_class=JSONResponse)
 def info():
@@ -143,14 +182,13 @@ def info():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Hata: {e}")
 
+
 # -------------------------------
 # 4) Tahmin (JSON → düz metin sayı)
 # -------------------------------
 @app.post("/predict", response_class=PlainTextResponse)
 def predict(req: PredictRequest):
-    """
-    Sadece sayısal değer döndürür (Pred_Final_Rounded).
-    """
+    """Sadece sayısal değer döndürür (Pred_Final_Rounded)."""
     try:
         out = tahmin_et(req.icd_list, req.bolum, req.yas_grup)
         val = out.get("Pred_Final_Rounded", None)
@@ -160,22 +198,61 @@ def predict(req: PredictRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Hata: {e}")
 
+
 # -------------------------------
 # 5) Tam JSON isteyenler için
 # -------------------------------
 @app.post("/predict_json", response_class=JSONResponse)
 def predict_json(req: PredictRequest):
-    """
-    Tüm detayları (ANCHOR_SRC, ANCHOR_P50, model skorları, final harman) döndürür.
-    """
+    """Tüm detayları (ANCHOR_SRC, ANCHOR_P50, model skorları, final harman) döndürür."""
     try:
         out = app_predict(req.yas_grup or "", req.bolum or "", req.icd_list)
         return out
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Hata: {e}")
 
+
 # -------------------------------
-# 6) Form-POST (opsiyonel)
+# 6) Dosya indirme uçları
+# -------------------------------
+def _file_or_404(path: str, download_name: Optional[str] = None) -> FileResponse:
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail=f"Dosya bulunamadı: {os.path.basename(path)}")
+    return FileResponse(path, filename=download_name or os.path.basename(path))
+
+
+@app.get("/download/lookup")
+def download_lookup():
+    return _file_or_404(LOOKUP_XLSX)
+
+
+@app.get("/download/pred_los")
+def download_pred_los():
+    return _file_or_404(PRED_LOS_XLSX)
+
+
+@app.get("/download/valid")
+def download_valid():
+    return _file_or_404(VALID_PRED_XLSX)
+
+
+@app.get("/download/yeni")
+def download_yeni():
+    return _file_or_404(YENI_VAKALAR_XLSX)
+
+
+@app.get("/download/model/{name}")
+def download_model_file(name: str):
+    # model_out klasörü içinden güvenli isimler
+    safe = re.fullmatch(r"[A-Za-z0-9_.\-]+", name)
+    if not safe:
+        raise HTTPException(status_code=400, detail="Geçersiz dosya adı")
+    path = os.path.join(MODEL_DIR, name)
+    return _file_or_404(path)
+
+
+# -------------------------------
+# 7) Form-POST (opsiyonel)
 # -------------------------------
 @app.post("/tahmin", response_class=PlainTextResponse)
 def tahmin_form(
@@ -195,10 +272,12 @@ def tahmin_form(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Hata: {e}")
 
+
 # -------------------------------
-# 7) Çalıştırıcı
+# 8) Çalıştırıcı
 # -------------------------------
 if __name__ == "__main__":
     import uvicorn
+
     port = int(os.environ.get("PORT", "10000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, workers=1)
