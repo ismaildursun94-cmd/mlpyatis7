@@ -7,15 +7,14 @@ from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
 from pydantic import BaseModel, field_validator
 import pandas as pd
 
-# proje.py'den adapter + debug amaçlı zengin JSON dönen fonksiyonları alıyoruz
 from proje import tahmin_et, app_predict, app_info
 
 LOOKUP_XLSX = os.environ.get("LOOKUP_XLSX", "LOS_Lookup_All.xlsx")
 
-app = FastAPI(title="LOS Predictor API", version="1.2.0")
+app = FastAPI(title="LOS Predictor API", version="1.3.0")
 
 # -------------------------------
-# 1) API Modeli (JSON istekleri için)
+# 1) API Modeli
 # -------------------------------
 class PredictRequest(BaseModel):
     icd_list: List[str]
@@ -30,7 +29,7 @@ class PredictRequest(BaseModel):
         return [str(s).strip() for s in v if s and str(s).strip()]
 
 # -------------------------------
-# 2) Ana Sayfa (Power BI benzeri arayüz)
+# 2) Ana Sayfa (Frontend)
 # -------------------------------
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -50,10 +49,10 @@ def index():
   }
   *{box-sizing:border-box}
   body{
-    margin:0; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+    margin:0; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial;
     color:var(--text);
     min-height:100vh;
-    background: #0b1725 url('https://images.unsplash.com/photo-1580281657527-47a2b90ac0e7?q=80&w=2070&auto=format&fit=crop') center/cover no-repeat fixed;
+    background:#0b1725;
   }
   .wrap{ max-width:1100px; margin:40px auto; padding:24px; }
   .panel{
@@ -71,25 +70,10 @@ def index():
     width:100%; height:44px; padding:10px 12px; border-radius:10px; border:1px solid #e5e7eb; background:#fff;
     outline:none;
   }
-  select:focus, input:focus{ border-color:var(--accent); box-shadow: 0 0 0 3px rgba(37,99,235,.2); }
-  .card{
-    margin-top:22px; padding:26px; border:1px solid #e5e7eb; border-radius:14px; background:#fff;
-  }
-  .title{ font-size:14px; color:var(--muted); margin-bottom:8px;}
-  .value{ font-size:36px; font-weight:800; }
   .btn{
     height:46px; border:none; background:var(--accent); color:#fff; font-weight:700; border-radius:10px; cursor:pointer;
   }
   .btn:disabled{ opacity:.6; cursor:not-allowed; }
-  /* ICD multiselect */
-  .icd-box{ position:relative; }
-  .icd-search{ width:100%; height:44px; padding:10px 12px; border:1px solid #e5e7eb; border-radius:10px; }
-  .icd-list{
-    position:absolute; left:0; right:0; top:52px; max-height:260px; overflow:auto; border:1px solid #e5e7eb; background:#fff;
-    border-radius:10px; z-index:20; display:none;
-  }
-  .icd-item{ padding:8px 12px; display:flex; align-items:center; gap:10px; border-bottom:1px solid #f3f4f6; }
-  .icd-item:hover{ background:#f9fafb; }
   .chipbar{ display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
   .chip{ background:#eef2ff; color:#3730a3; padding:4px 8px; border-radius:999px; font-size:12px; }
 </style>
@@ -107,23 +91,22 @@ def index():
           <select id="yas"></select>
 
           <label style="margin-top:14px;">ICD (çoklu seçim)</label>
-          <div class="icd-box" id="icdBox">
-            <input id="icdSearch" class="icd-search" placeholder="ICD ara (örn: K80)" />
-            <div class="icd-list" id="icdList"></div>
-          </div>
+          <input id="manualICD" type="text" placeholder="ICD kodu girin (örn: A04||K30||R51)" />
+          <button class="btn" style="margin-top:6px; margin-bottom:8px;" id="addManual">Ekle</button>
+
           <div class="chipbar" id="chips"></div>
 
-          <button class="btn" id="btn">Tahmin Et</button>
+          <button class="btn" id="btn" style="margin-top:16px;">Tahmin Et</button>
         </div>
 
         <div>
-          <div class="card">
-            <div class="title">Tahmini Yatış (P50)</div>
-            <div class="value" id="result">Seçenekleri Doldurunuz</div>
+          <div class="panel" style="background:#111827;color:#fff">
+            <div style="font-size:14px; color:#9ca3af;">Tahmini Yatış (P50)</div>
+            <div style="font-size:44px; font-weight:800; margin-top:4px;" id="result">-</div>
           </div>
-          <div class="card" style="margin-top:14px;">
-            <div class="title">Açıklama</div>
-            <div style="font-size:13px; color:#374151">
+          <div class="panel" style="margin-top:14px;">
+            <div class="title" style="font-size:14px; color:#374151;">Açıklama</div>
+            <div style="font-size:13px; color:#374151;">
               /predict sadece sayıyı döndürür. Tam JSON ve ANCHOR bilgileri için <code>POST /predict_json</code> kullanın.
             </div>
           </div>
@@ -133,35 +116,15 @@ def index():
   </div>
 
 <script>
-async function loadOptions(){
-  const res = await fetch('/options');
-  if(!res.ok) throw new Error('options yüklenemedi');
-  return res.json();
-}
-
-// ---- ICD multiselect helpers
 const state = { icds: [] };
 
-function renderICDList(all){
-  const list = document.getElementById('icdList');
-  list.innerHTML = "";
-  all.forEach(code=>{
-    const row = document.createElement('div');
-    row.className = 'icd-item';
-    const cb = document.createElement('input'); cb.type='checkbox'; cb.value=code;
-    cb.checked = state.icds.includes(code);
-    cb.addEventListener('change', (e)=>{
-      if(e.target.checked){
-        if(!state.icds.includes(code)) state.icds.push(code);
-      }else{
-        state.icds = state.icds.filter(x=>x!==code);
-      }
-      renderChips();
-    });
-    const lbl = document.createElement('span'); lbl.textContent = code;
-    row.appendChild(cb); row.appendChild(lbl);
-    list.appendChild(row);
-  });
+function addICDsFromText(txt){
+  if(!txt) return;
+  const parts = txt.split(/\\|\\||,|;|\\s+/).map(s=>s.trim()).filter(Boolean);
+  for(const p of parts){
+    if(!state.icds.includes(p)) state.icds.push(p);
+  }
+  renderChips();
 }
 
 function renderChips(){
@@ -169,26 +132,16 @@ function renderChips(){
   bar.innerHTML = "";
   state.icds.forEach(code=>{
     const c = document.createElement('span');
-    c.className='chip'; c.textContent = code;
+    c.className='chip';
+    c.textContent = code;
     bar.appendChild(c);
   });
 }
 
-function attachICDSearch(all){
-  const box = document.getElementById('icdBox');
-  const input = document.getElementById('icdSearch');
-  const list = document.getElementById('icdList');
-
-  input.addEventListener('focus', ()=>{ list.style.display='block'; });
-  input.addEventListener('input', ()=>{
-    const q = input.value.trim().toLowerCase();
-    const filtered = all.filter(x=>x.toLowerCase().includes(q));
-    renderICDList(filtered);
-  });
-  document.addEventListener('click', (e)=>{
-    if(!box.contains(e.target)){ list.style.display='none'; }
-  });
-  renderICDList(all);
+async function loadOptions(){
+  const res = await fetch('/options');
+  if(!res.ok) throw new Error('options yüklenemedi');
+  return res.json();
 }
 
 function fillSelect(sel, items, placeholder){
@@ -207,11 +160,16 @@ function fillSelect(sel, items, placeholder){
     const opts = await loadOptions();
     fillSelect(document.getElementById('bolum'), opts.bolum, 'Tümü');
     fillSelect(document.getElementById('yas'), opts.yas_grup, 'Tümü');
-    attachICDSearch(opts.icd);
+
+    document.getElementById('addManual').addEventListener('click', ()=>{
+      const val = document.getElementById('manualICD').value.trim();
+      addICDsFromText(val);
+      document.getElementById('manualICD').value = "";
+    });
 
     document.getElementById('btn').addEventListener('click', async ()=>{
       const bolum = document.getElementById('bolum').value || null;
-      const yas   = document.getElementById('yas').value || null;
+      const yas = document.getElementById('yas').value || null;
       const icd_list = state.icds.slice();
       const resultEl = document.getElementById('result');
 
@@ -229,7 +187,6 @@ function fillSelect(sel, items, placeholder){
       const text = await res.text();
       resultEl.textContent = text;
     });
-
   }catch(err){
     document.getElementById('result').textContent = "Hata: " + err.message;
   }
@@ -254,47 +211,24 @@ def info():
         raise HTTPException(status_code=500, detail=f"Hata: {e}")
 
 # -------------------------------
-# 3.5) Seçenek listeleri (Power BI benzeri dropdownlar için)
+# 4) Seçenek listeleri
 # -------------------------------
 @app.get("/options", response_class=JSONResponse)
 def options():
-    """
-    LOOKUP_XLSX dosyasından:
-    - DIM_YASGRUP -> yas_grup listesi
-    - DIM_ICD -> icd listesi
-    - LKP_2D_FULL -> Bölüm listesi (unique)
-    """
     try:
         if not os.path.exists(LOOKUP_XLSX):
             raise FileNotFoundError(f"{LOOKUP_XLSX} bulunamadı")
         x = pd.ExcelFile(LOOKUP_XLSX)
-        # Yaş grupları
-        if "DIM_YASGRUP" in x.sheet_names:
-            yg = pd.read_excel(x, "DIM_YASGRUP")["YaşGrup"].dropna().astype(str).unique().tolist()
-        else:
-            yg = []
-        # ICD
-        if "DIM_ICD" in x.sheet_names:
-            icd = pd.read_excel(x, "DIM_ICD")["ICD"].dropna().astype(str).tolist()
-        else:
-            icd = []
-        # Bölüm (2D full'den unique)
-        if "LKP_2D_FULL" in x.sheet_names:
-            bol = pd.read_excel(x, "LKP_2D_FULL")["Bölüm"].dropna().astype(str).unique().tolist()
-        else:
-            bol = []
-
-        # Güzel bir sıralama: alfabetik
-        yg = sorted(yg, key=lambda s: (s[0].isdigit(), s))
-        bol = sorted(bol)
-        icd = sorted(icd)
-
+        yg = pd.read_excel(x, "DIM_YASGRUP")["YaşGrup"].dropna().astype(str).unique().tolist() if "DIM_YASGRUP" in x.sheet_names else []
+        icd = pd.read_excel(x, "DIM_ICD")["ICD"].dropna().astype(str).tolist() if "DIM_ICD" in x.sheet_names else []
+        bol = pd.read_excel(x, "LKP_2D_FULL")["Bölüm"].dropna().astype(str).unique().tolist() if "LKP_2D_FULL" in x.sheet_names else []
+        yg = sorted(yg); bol = sorted(bol); icd = sorted(icd)
         return {"yas_grup": yg, "bolum": bol, "icd": icd}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"options hatası: {e}")
 
 # -------------------------------
-# 4) Tahmin (JSON → düz metin sayı)
+# 5) Tahmin
 # -------------------------------
 @app.post("/predict", response_class=PlainTextResponse)
 def predict(req: PredictRequest):
@@ -307,19 +241,15 @@ def predict(req: PredictRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Hata: {e}")
 
-# -------------------------------
-# 5) Tam JSON isteyenler için
-# -------------------------------
 @app.post("/predict_json", response_class=JSONResponse)
 def predict_json(req: PredictRequest):
     try:
-        out = app_predict(req.yas_grup or "", req.bolum or "", req.icd_list)
-        return out
+        return app_predict(req.yas_grup or "", req.bolum or "", req.icd_list)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Hata: {e}")
 
 # -------------------------------
-# 6) Form-POST (opsiyonel)
+# 6) Form
 # -------------------------------
 @app.post("/tahmin", response_class=PlainTextResponse)
 def tahmin_form(
@@ -328,7 +258,7 @@ def tahmin_form(
     yas_grup: Optional[str] = Form(None),
 ):
     try:
-        icds = [s.strip() for s in re.split(r"[,\;\|\s]+", re.sub(r"\|\|", ",", icd_text or "")) if s.strip()]
+        icds = [s.strip() for s in re.split(r"[,;|\\s]+", re.sub(r"\\|\\|", "|", icd_text or "")) if s.strip()]
         out = tahmin_et(icds, bolum, yas_grup)
         val = out.get("Pred_Final_Rounded", None)
         if val is None:
@@ -337,9 +267,6 @@ def tahmin_form(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Hata: {e}")
 
-# -------------------------------
-# 7) Çalıştırıcı
-# -------------------------------
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "10000"))
