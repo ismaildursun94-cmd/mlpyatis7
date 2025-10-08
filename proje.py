@@ -746,16 +746,24 @@ if "PRED_XGB_ENS" in valid_pred_df.columns:
 
 # ================== 11) APP KULLANIMI – FONKSİYONLAR ==================
 def app_normalize_inputs(yas_grup: str, bolum: str, icd_input) -> tuple:
+    """
+    icd_input metin ise: 'A09||A49 Z94.8;B00' gibi karışık ayraçları düzgün parçalar,
+    temizler (clean_icd), tekilleştirir ve sıralar.
+    """
     yg_in = str(yas_grup or "").strip()
     b_in  = str(bolum or "").strip()
     yg, b = canon_demo(yg_in, b_in)
 
+    parts = []
     if isinstance(icd_input, str):
-        parts = [clean_icd(p) for p in re.split(r"[;,]", icd_input) if p.strip()]
+        icd_input = re.sub(r"\|\|", ",", icd_input)
+        raw = [s for s in re.split(r"[,\;\|\s]+", icd_input) if s.strip()]
+        parts = [clean_icd(p) for p in raw]
     elif isinstance(icd_input, (list, tuple, set)):
         parts = [clean_icd(p) for p in icd_input if str(p).strip()]
     else:
         parts = []
+
     parts = sorted(set([p for p in parts if p]))
     key = "||".join(parts)
     return yg, b, parts, key
@@ -814,8 +822,10 @@ def app_info():
 
 # ================== APP adapter ==================
 def tahmin_et(icd_list, bolum=None, yas_grup=None):
+    # Tek metin geldiyse '||' dahil tüm ayraçları destekle
     if isinstance(icd_list, str):
-        icd_list = [s.strip() for s in icd_list.split(",") if s.strip()]
+        icd_list = re.sub(r"\|\|", ",", icd_list or "")
+        icd_list = [s for s in re.split(r"[,\;\|\s]+", icd_list) if s.strip()]
 
     parts = [clean_icd(x) for x in icd_list if str(x).strip()]
     parts = sorted(set([p for p in parts if p]))
@@ -836,4 +846,3 @@ def tahmin_et(icd_list, bolum=None, yas_grup=None):
             pred_out = (1.0 - w) * float(pred_rule) + w * float(p_ens)
 
     return {"Pred_Final": float(pred_out), "Pred_Final_Rounded": round_half_up(pred_out)}
-# ================== /APP adapter ==================
