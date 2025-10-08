@@ -76,7 +76,7 @@ XGB_PARAMS = dict(
 
 STRICT_SHORT_CIRCUIT = True
 PREFER_TRAIN_FOR_EXACT = True
-USE_FULL_FOR_EXACT = False
+USE_FULL_FOR_EXACT = True
 # ====================================================
 
 __all__ = ["tahmin_et","app_predict","app_predict_many","app_info"]
@@ -408,36 +408,38 @@ for _, r in LKP_PAIR.iterrows():
 single_floor_map = dict(zip(LKP_ICD["ICD_Kod"], LKP_ICD["P50"]))
 
 def find_anchor(yg: str, bolum: str, key: str):
-    def train_exact():
-        if (yg, bolum, key) in lkp3_map: return "3D", *lkp3_map[(yg, bolum, key)], key
-        if (bolum, key) in lkp2_map:     return "2D", *lkp2_map[(bolum, key)], key
-        if key in lkp1_map:              return "1D", *lkp1_map[key], key
-        return None
+    # --- TRAIN tarafı ---
+    train_3d = lkp3_map.get((yg, bolum, key))
+    train_2d = lkp2_map.get((bolum, key))
+    train_1d = lkp1_map.get(key)
 
-    def full_exact():
-        if (yg, bolum, key) in lkp3_full_map: return "3D", *lkp3_full_map[(yg, bolum, key)], key
-        if (bolum, key) in lkp2_full_map:     return "2D", *lkp2_full_map[(bolum, key)], key
-        if key in lkp1_full_map:              return "1D", *lkp1_full_map[key], key
-        return None
+    # --- FULL tarafı ---
+    full_3d  = lkp3_full_map.get((yg, bolum, key))
+    full_2d  = lkp2_full_map.get((bolum, key))
+    full_1d  = lkp1_full_map.get(key)
 
-    if USE_FULL_FOR_EXACT:
-        if PREFER_TRAIN_FOR_EXACT:
-            return train_exact() or full_exact() or (None, None, 0, None)
-        else:
-            return full_exact() or train_exact() or (None, None, 0, None)
-    else:
-        return train_exact() or (None, None, 0, None)
+    # KATI ÖNCELİK: TRAIN 1D > TRAIN 2D > TRAIN 3D > FULL 1D > FULL 2D > FULL 3D
+    if train_1d is not None:
+        p50, n = train_1d
+        return "1D_TRAIN", float(p50), int(n), key
+    if train_2d is not None:
+        p50, n = train_2d
+        return "2D_TRAIN", float(p50), int(n), key
+    if train_3d is not None:
+        p50, n = train_3d
+        return "3D_TRAIN", float(p50), int(n), key
 
-def _topk_weighted_anchor(candidates, target_set:set, K:int=TOPK_NEIGHBORS, rho:float=RHO_J):
-    scored = []
-    for key, p50, n in candidates:
-        J = jaccard(target_set, as_set(key))
-        if p50 is None:
-            continue
-        scored.append((J, float(p50), int(n if n is not None else 0), key))
+    if full_1d is not None:
+        p50, n = full_1d
+        return "1D_FULL", float(p50), int(n), key
+    if full_2d is not None:
+        p50, n = full_2d
+        return "2D_FULL", float(p50), int(n), key
+    if full_3d is not None:
+        p50, n = full_3d
+        return "3D_FULL", float(p50), int(n), key
 
-    if not scored:
-        return 0.0, None, None
+    return (None, None, 0, None)
 
     scored.sort(key=lambda x: (x[0], x[2], x[1]), reverse=True)
     bestJ, bestP50, _bestN, bestKey = scored[0]
