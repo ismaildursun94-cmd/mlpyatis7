@@ -76,6 +76,7 @@ XGB_PARAMS = dict(
 
 STRICT_SHORT_CIRCUIT = True
 PREFER_TRAIN_FOR_EXACT = True
+USE_FULL_FOR_EXACT = False
 # ====================================================
 
 __all__ = ["tahmin_et","app_predict","app_predict_many","app_info"]
@@ -407,38 +408,25 @@ for _, r in LKP_PAIR.iterrows():
 single_floor_map = dict(zip(LKP_ICD["ICD_Kod"], LKP_ICD["P50"]))
 
 def find_anchor(yg: str, bolum: str, key: str):
-    # Exact-match arama sırası:
-    if PREFER_TRAIN_FOR_EXACT:
-        # 1) Önce TRAIN lookuplar
-        if (yg, bolum, key) in lkp3_map:
-            p50, n = lkp3_map[(yg, bolum, key)]; return "3D", float(p50), n, key
-        if (bolum, key) in lkp2_map:
-            p50, n = lkp2_map[(bolum, key)];     return "2D", float(p50), n, key
-        if key in lkp1_map:
-            p50, n = lkp1_map[key];              return "1D", float(p50), n, key
-        # 2) TRAIN’de yoksa FULL lookuplar
-        if (yg, bolum, key) in lkp3_full_map:
-            p50, n = lkp3_full_map[(yg, bolum, key)]; return "3D", float(p50), n, key
-        if (bolum, key) in lkp2_full_map:
-            p50, n = lkp2_full_map[(bolum, key)];     return "2D", float(p50), n, key
-        if key in lkp1_full_map:
-            p50, n = lkp1_full_map[key];              return "1D", float(p50), n, key
-    else:
-        # Eski davranış (FULL -> TRAIN)
-        if (yg, bolum, key) in lkp3_full_map:
-            p50, n = lkp3_full_map[(yg, bolum, key)]; return "3D", float(p50), n, key
-        if (bolum, key) in lkp2_full_map:
-            p50, n = lkp2_full_map[(bolum, key)];     return "2D", float(p50), n, key
-        if key in lkp1_full_map:
-            p50, n = lkp1_full_map[key];              return "1D", float(p50), n, key
-        if (yg, bolum, key) in lkp3_map:
-            p50, n = lkp3_map[(yg, bolum, key)];      return "3D", float(p50), n, key
-        if (bolum, key) in lkp2_map:
-            p50, n = lkp2_map[(bolum, key)];          return "2D", float(p50), n, key
-        if key in lkp1_map:
-            p50, n = lkp1_map[key];                   return "1D", float(p50), n, key
+    def train_exact():
+        if (yg, bolum, key) in lkp3_map: return "3D", *lkp3_map[(yg, bolum, key)], key
+        if (bolum, key) in lkp2_map:     return "2D", *lkp2_map[(bolum, key)], key
+        if key in lkp1_map:              return "1D", *lkp1_map[key], key
+        return None
 
-    return None, None, 0, None
+    def full_exact():
+        if (yg, bolum, key) in lkp3_full_map: return "3D", *lkp3_full_map[(yg, bolum, key)], key
+        if (bolum, key) in lkp2_full_map:     return "2D", *lkp2_full_map[(bolum, key)], key
+        if key in lkp1_full_map:              return "1D", *lkp1_full_map[key], key
+        return None
+
+    if USE_FULL_FOR_EXACT:
+        if PREFER_TRAIN_FOR_EXACT:
+            return train_exact() or full_exact() or (None, None, 0, None)
+        else:
+            return full_exact() or train_exact() or (None, None, 0, None)
+    else:
+        return train_exact() or (None, None, 0, None)
 
 def _topk_weighted_anchor(candidates, target_set:set, K:int=TOPK_NEIGHBORS, rho:float=RHO_J):
     scored=[]
