@@ -746,18 +746,30 @@ if "PRED_XGB_ENS" in valid_pred_df.columns:
 
 # ================== 11) APP KULLANIMI – FONKSİYONLAR ==================
 def app_normalize_inputs(yas_grup: str, bolum: str, icd_input) -> tuple:
+    """
+    Girdi ister string ister liste olsun; '||', '|', ',', ';' ve boşluğa göre parçala.
+    ICD'leri temizle, tekilleştir, sırala. Anahtarı clean_icd_set_key ile normalize et.
+    """
     yg_in = str(yas_grup or "").strip()
     b_in  = str(bolum or "").strip()
     yg, b = canon_demo(yg_in, b_in)
 
+    parts = []
     if isinstance(icd_input, str):
-        parts = [clean_icd(p) for p in re.split(r"[;,]", icd_input) if p.strip()]
+        # "||" -> "|" çevir, sonra [ , ; | boşluk ] hepsine göre split
+        s = re.sub(r"\|\|", "|", icd_input or "")
+        parts = [clean_icd(p) for p in re.split(r"[,\;\|\s]+", s) if p.strip()]
     elif isinstance(icd_input, (list, tuple, set)):
-        parts = [clean_icd(p) for p in icd_input if str(p).strip()]
+        tmp = []
+        for it in icd_input:
+            s = re.sub(r"\|\|", "|", str(it or ""))
+            tmp.extend([p for p in re.split(r"[,\;\|\s]+", s) if p.strip()])
+        parts = [clean_icd(p) for p in tmp]
     else:
         parts = []
+
     parts = sorted(set([p for p in parts if p]))
-    key = "||".join(parts)
+    key = clean_icd_set_key("||".join(parts))  # LKP_* anahtarıyla birebir
     return yg, b, parts, key
 
 def app_predict(yas_grup: str, bolum: str, icd_input):
@@ -814,12 +826,21 @@ def app_info():
 
 # ================== APP adapter ==================
 def tahmin_et(icd_list, bolum=None, yas_grup=None):
+    """
+    /predict ve /tahmin gibi çağrılar buradan geçiyor.
+    Girdi ister string ister liste olsun; '||', '|', ',', ';' ve boşluğa göre parçala.
+    """
     if isinstance(icd_list, str):
-        icd_list = [s.strip() for s in icd_list.split(",") if s.strip()]
+        s = re.sub(r"\|\|", "|", icd_list or "")
+        parts_raw = [p for p in re.split(r"[,\;\|\s]+", s) if p.strip()]
+    else:
+        parts_raw = []
+        for it in (icd_list or []):
+            s = re.sub(r"\|\|", "|", str(it or ""))
+            parts_raw.extend([p for p in re.split(r"[,\;\|\s]+", s) if p.strip()])
 
-    parts = [clean_icd(x) for x in icd_list if str(x).strip()]
-    parts = sorted(set([p for p in parts if p]))
-    key = "||".join(parts)
+    parts = sorted(set([clean_icd(x) for x in parts_raw if str(x).strip()]))
+    key = clean_icd_set_key("||".join(parts))
 
     yg, b = canon_demo((yas_grup or "").strip(), (bolum or "").strip())
 
@@ -836,4 +857,3 @@ def tahmin_et(icd_list, bolum=None, yas_grup=None):
             pred_out = (1.0 - w) * float(pred_rule) + w * float(p_ens)
 
     return {"Pred_Final": float(pred_out), "Pred_Final_Rounded": round_half_up(pred_out)}
-# ================== /APP adapter ==================
