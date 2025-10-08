@@ -429,34 +429,54 @@ def find_anchor(yg: str, bolum: str, key: str):
         return train_exact() or (None, None, 0, None)
 
 def _topk_weighted_anchor(candidates, target_set:set, K:int=TOPK_NEIGHBORS, rho:float=RHO_J):
-    scored=[]
+    scored = []
     for key, p50, n in candidates:
         J = jaccard(target_set, as_set(key))
-        if p50 is None: continue
+        if p50 is None:
+            continue
         scored.append((J, float(p50), int(n if n is not None else 0), key))
-    if not scored: return 0.0, None, None
+
+    if not scored:
+        return 0.0, None, None
+
     scored.sort(key=lambda x: (x[0], x[2], x[1]), reverse=True)
     bestJ, bestP50, _bestN, bestKey = scored[0]
+
+    # 🔒 Hiç örtüşme yoksa (J=0) “komşu” kabul etme
+    if bestJ <= 0.0:
+        return 0.0, None, None
+
     topk = [r for r in scored if r[0] > 0.0][:K]
-    if not topk: return bestJ, bestP50, bestKey
-    Wvals = [(((J**float(rho)) * math.log1p(max(0,n))), p50) for J,p50,n,_k in topk]
-    W = sum(w for w,_ in Wvals)
-    if W<=0: return bestJ, bestP50, bestKey
-    wmean = sum(p*w for w,p in Wvals)/W
+    Wvals = [(((J**float(rho)) * math.log1p(max(0, n))), p50) for J, p50, n, _k in topk]
+    W = sum(w for w, _ in Wvals)
+    if W <= 0:
+        return bestJ, bestP50, bestKey
+    wmean = sum(p * w for w, p in Wvals) / W
     return bestJ, float(wmean), bestKey
 
 def nearest_neighbor_anchor(yg:str, bolum:str, target_key:str):
     target = as_set(target_key)
-    cand3 = [(key, *lkp3_map.get((yg, bolum, key), (None,0))) for key in ctx3_by_demo.get((yg, bolum), [])]
+
+    # 3D (J>0 gerek)
+    cand3 = [(key, *lkp3_map.get((yg, bolum, key), (None, 0))) for key in ctx3_by_demo.get((yg, bolum), [])]
     bestJ, w_p50, bestKey = _topk_weighted_anchor(cand3, target)
-    if bestKey is not None: return bestJ, float(w_p50 if w_p50 is not None else lkp0_p50), bestKey, "3D_DEMO"
-    cand2 = [(key,p50,n) for (b,key),(p50,n) in lkp2_map.items() if b==bolum]
+    if bestKey is not None:
+        return bestJ, float(w_p50 if w_p50 is not None else lkp0_p50), bestKey, "3D_DEMO"
+
+    # 2D (J>0 gerek)
+    cand2 = [(key, p50, n) for (b, key), (p50, n) in lkp2_map.items() if b == bolum]
     bestJ, w_p50, bestKey = _topk_weighted_anchor(cand2, target)
-    if bestKey is not None: return bestJ, float(w_p50 if w_p50 is not None else lkp0_p50), bestKey, "2D"
-    cand1 = [(key,p50,n) for key,(p50,n) in lkp1_map.items()]
+    if bestKey is not None:
+        return bestJ, float(w_p50 if w_p50 is not None else lkp0_p50), bestKey, "2D"
+
+    # 1D (J>0 varsa onu al)
+    cand1 = [(key, p50, n) for key, (p50, n) in lkp1_map.items()]
     bestJ, w_p50, bestKey = _topk_weighted_anchor(cand1, target)
-    if bestKey is not None: return bestJ, float(w_p50 if w_p50 is not None else lkp0_p50), bestKey, "1D"
-    return 0.0, lkp0_p50, None, "0D"
+    if bestKey is not None:
+        return bestJ, float(w_p50 if w_p50 is not None else lkp0_p50), bestKey, "1D"
+
+    #Hiçbiri yoksa artık tahmin verme
+    return 0.0, 0.0, None, "NONE"
 
 def model_contrib(target_key:str, anchor_key:str):
     T = as_set(target_key); A = as_set(anchor_key) if anchor_key else set()
