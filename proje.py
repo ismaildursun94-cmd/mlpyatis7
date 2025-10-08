@@ -75,7 +75,7 @@ XGB_PARAMS = dict(
 )
 
 STRICT_SHORT_CIRCUIT = True
-PREFER_TRAIN_FOR_EXACT = False
+PREFER_TRAIN_FOR_EXACT = True
 USE_FULL_FOR_EXACT = True
 # ====================================================
 
