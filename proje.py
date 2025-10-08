@@ -441,6 +441,17 @@ def find_anchor(yg: str, bolum: str, key: str):
 
     return (None, None, 0, None)
 
+def _topk_weighted_anchor(candidates, target_set:set, K:int=TOPK_NEIGHBORS, rho:float=RHO_J):
+    scored = []
+    for key, p50, n in candidates:
+        J = jaccard(target_set, as_set(key))
+        if p50 is None:
+            continue
+        scored.append((J, float(p50), int(n if n is not None else 0), key))
+
+    if not scored:
+        return 0.0, None, None
+
     scored.sort(key=lambda x: (x[0], x[2], x[1]), reverse=True)
     bestJ, bestP50, _bestN, bestKey = scored[0]
 
@@ -519,7 +530,7 @@ def predict_one(yg:str, bolum:str, target_key:str):
     src, anchor_p50, n, anchor_key = find_anchor(yg, bolum, target_key)
 
     # 3D/2D/1D birebir eşleşme → short-circuit
-    if anchor_p50 is not None and anchor_key == target_key and src in ("3D","2D","1D"):
+    if anchor_p50 is not None and anchor_key == target_key and not str(src).startswith("NEIGHBOR"):
         meta = {"ANCHOR_SRC": src, "ANCHOR_KEY": anchor_key or "", "ANCHOR_P50": float(anchor_p50),
                 "ALPHA_JACCARD": 0.0, "ADDED_ICDS": "", "BETA_SUM": 0.0, "GAMMA_SUM": 0.0,
                 "MODEL_PRED": float(anchor_p50), "PRED_BLEND": float(anchor_p50), "SHORT_CIRCUIT": True}
@@ -748,17 +759,12 @@ if "PRED_XGB_ENS" in valid_pred_df.columns:
 
 # ================== 11) APP KULLANIMI – FONKSİYONLAR ==================
 def app_normalize_inputs(yas_grup: str, bolum: str, icd_input) -> tuple:
-    """
-    Girdi ister string ister liste olsun; '||', '|', ',', ';' ve boşluğa göre parçala.
-    ICD'leri temizle, tekilleştir, sırala. Anahtarı clean_icd_set_key ile normalize et.
-    """
     yg_in = str(yas_grup or "").strip()
     b_in  = str(bolum or "").strip()
     yg, b = canon_demo(yg_in, b_in)
 
     parts = []
     if isinstance(icd_input, str):
-        # "||" -> "|" çevir, sonra [ , ; | boşluk ] hepsine göre split
         s = re.sub(r"\|\|", "|", icd_input or "")
         parts = [clean_icd(p) for p in re.split(r"[,\;\|\s]+", s) if p.strip()]
     elif isinstance(icd_input, (list, tuple, set)):
@@ -771,7 +777,7 @@ def app_normalize_inputs(yas_grup: str, bolum: str, icd_input) -> tuple:
         parts = []
 
     parts = sorted(set([p for p in parts if p]))
-    key = clean_icd_set_key("||".join(parts))  # LKP_* anahtarıyla birebir
+    key = clean_icd_set_key("||".join(parts))
     return yg, b, parts, key
 
 def app_predict(yas_grup: str, bolum: str, icd_input):
@@ -828,10 +834,6 @@ def app_info():
 
 # ================== APP adapter ==================
 def tahmin_et(icd_list, bolum=None, yas_grup=None):
-    """
-    /predict ve /tahmin gibi çağrılar buradan geçiyor.
-    Girdi ister string ister liste olsun; '||', '|', ',', ';' ve boşluğa göre parçala.
-    """
     if isinstance(icd_list, str):
         s = re.sub(r"\|\|", "|", icd_list or "")
         parts_raw = [p for p in re.split(r"[,\;\|\s]+", s) if p.strip()]
@@ -845,7 +847,6 @@ def tahmin_et(icd_list, bolum=None, yas_grup=None):
     key = clean_icd_set_key("||".join(parts))
 
     yg, b = canon_demo((yas_grup or "").strip(), (bolum or "").strip())
-
     pred_rule, meta = predict_one(yg, b, key)
     p_plain, p_log, p_ens = xgb_predict_ens(yg, b, key, parts)
 
