@@ -1,30 +1,52 @@
 # app.py
 import os
-from typing import List, Optional
+from typing import List, Optional, Union
 from fastapi import FastAPI, HTTPException, Form
 from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
 from pydantic import BaseModel, field_validator
+import re
 
 # proje.py'den adapter + debug amaçlı zengin JSON dönen fonksiyonları alıyoruz
 from proje import tahmin_et, app_predict, app_info
 
-app = FastAPI(title="LOS Predictor API", version="1.1.0")
+app = FastAPI(title="LOS Predictor API", version="1.1.1")
 
 # -------------------------------
 # 1) API Modeli (JSON istekleri için)
 # -------------------------------
 class PredictRequest(BaseModel):
-    icd_list: List[str]
+    # icd_list string veya liste gelebilir: "A04||K30, R51  R90.0" ya da ["A04","K30",...]
+    icd_list: Union[str, List[str]]
     bolum: Optional[str] = None
     yas_grup: Optional[str] = None
 
+    # JSON parse edilmeden ÖNCE string/listeyi normalize et
+    @field_validator("icd_list", mode="before")
+    @classmethod
+    def _coerce_icd_list(cls, v):
+        def split_any(s: str):
+            s = re.sub(r"\|\|", "|", s or "")
+            return [p.strip() for p in re.split(r"[,\;\|\s]+", s) if p and p.strip()]
+        if isinstance(v, str):
+            return split_any(v)
+        elif isinstance(v, (list, tuple, set)):
+            tmp = []
+            for it in v:
+                if isinstance(it, str):
+                    tmp.extend(split_any(it))
+                else:
+                    tmp.append(str(it))
+            return tmp
+        return []
+
+    # Boş olamaz + trimle
     @field_validator("icd_list")
     @classmethod
-    def _not_empty(cls, v):
+    def _not_empty(cls, v: List[str]):
+        v = [s.strip() for s in v if s and s.strip()]
         if not v:
             raise ValueError("icd_list boş olamaz")
-        return [s.strip() for s in v if s and s.strip()]
-
+        return v
 
 # -------------------------------
 # 2) Ana Sayfa (yalın arayüz)
@@ -51,8 +73,8 @@ def index():
     <body>
         <h2>LOS Tahmin Arayüzü</h2>
         <form id="predictForm">
-            <label>ICD Listesi (virgülle):</label>
-            <input type="text" id="icd_list" name="icd_list" value="K80.0">
+            <label>ICD Listesi (virgül, ||, boşluk vs. hepsi olur):</label>
+            <input type="text" id="icd_list" name="icd_list" value="A00||C91.0 T81.4, Z94.8">
 
             <label>Bölüm (ops.):</label>
             <input type="text" id="bolum" name="bolum" placeholder="örn. Kardiyoloji">
@@ -67,9 +89,17 @@ def index():
         <p><small>/predict sadece sayı döndürür. Tam JSON ve ANCHOR bilgileri için <code>POST /predict_json</code> kullan.</small></p>
 
         <script>
+        function splitAny(s) {
+          if (!s) return [];
+          s = s.replaceAll("||","|");
+          return s.split(/[,;|\\s]+/).map(x => x.trim()).filter(Boolean);
+        }
+
         document.getElementById("predictForm").addEventListener("submit", async (e) => {
             e.preventDefault();
-            const icd = document.getElementById("icd_list").value.split(",").map(x => x.trim()).filter(x => x);
+            const icdRaw = document.getElementById("icd_list").value;
+            const icd = splitAny(icdRaw);
+
             const bolum = document.getElementById("bolum").value.trim();
             const yas   = document.getElementById("yas_grup").value.trim();
 
@@ -83,17 +113,21 @@ def index():
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify(body)
                 });
+                if(!res.ok){
+                  const j = await res.json().catch(()=>({}));
+                  resEl.textContent = "Hata: " + (j.detail || res.status);
+                  return;
+                }
                 const text = await res.text();   // sadece sayı dönüyor
                 resEl.textContent = text;
             } catch (err) {
-                resEl.textContent = "Hata";
+                resEl.textContent = "Hata: " + (err?.message || err);
             }
         });
         </script>
     </body>
     </html>
     """
-
 
 # -------------------------------
 # 3) Sağlık / bilgi
@@ -108,7 +142,6 @@ def info():
         return app_info()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Hata: {e}")
-
 
 # -------------------------------
 # 4) Tahmin (JSON → düz metin sayı)
@@ -127,7 +160,6 @@ def predict(req: PredictRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Hata: {e}")
 
-
 # -------------------------------
 # 5) Tam JSON isteyenler için
 # -------------------------------
@@ -142,9 +174,8 @@ def predict_json(req: PredictRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Hata: {e}")
 
-
 # -------------------------------
-# 6) Form-POST isteyenler için alternatif (opsiyonel)
+# 6) Form-POST (opsiyonel)
 # -------------------------------
 @app.post("/tahmin", response_class=PlainTextResponse)
 def tahmin_form(
@@ -153,7 +184,9 @@ def tahmin_form(
     yas_grup: Optional[str] = Form(None),
 ):
     try:
-        icds = [s.strip() for s in icd_text.split(",") if s.strip()]
+        # Formdan gelen serbest metni de aynı kuralla parçala
+        s = re.sub(r"\|\|", "|", icd_text or "")
+        icds = [p.strip() for p in re.split(r"[,\;\|\s]+", s) if p.strip()]
         out = tahmin_et(icds, bolum, yas_grup)
         val = out.get("Pred_Final_Rounded", None)
         if val is None:
@@ -161,7 +194,6 @@ def tahmin_form(
         return str(val)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Hata: {e}")
-
 
 # -------------------------------
 # 7) Çalıştırıcı
