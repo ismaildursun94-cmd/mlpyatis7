@@ -75,8 +75,8 @@ XGB_PARAMS = dict(
 )
 
 STRICT_SHORT_CIRCUIT = True
-PREFER_TRAIN_FOR_EXACT = True
-USE_FULL_FOR_EXACT = False
+PREFER_TRAIN_FOR_EXACT = False
+USE_FULL_FOR_EXACT = True
 # ====================================================
 
 __all__ = ["tahmin_et","app_predict","app_predict_many","app_info"]
