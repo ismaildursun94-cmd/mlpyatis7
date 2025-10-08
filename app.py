@@ -1,19 +1,18 @@
+# app.py
 import os
 import re
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Form
 from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
 from pydantic import BaseModel, field_validator
+import pandas as pd
 
 # proje.py'den adapter + debug amaçlı zengin JSON dönen fonksiyonları alıyoruz
 from proje import tahmin_et, app_predict, app_info
 
+LOOKUP_XLSX = os.environ.get("LOOKUP_XLSX", "LOS_Lookup_All.xlsx")
+
 app = FastAPI(title="LOS Predictor API", version="1.2.0")
-
-# ---- ICD listesi için kaynak Excel (proje.py'nin ürettiği) ----
-ICD_XLSX = os.environ.get("LOOKUP_XLSX", "LOS_Lookup_All.xlsx")
-_ICD_CACHE: Optional[List[str]] = None  # lazy cache
-
 
 # -------------------------------
 # 1) API Modeli (JSON istekleri için)
@@ -28,200 +27,220 @@ class PredictRequest(BaseModel):
     def _not_empty(cls, v):
         if not v:
             raise ValueError("icd_list boş olamaz")
-        # Güvenlik: boş/None elemanları at
         return [str(s).strip() for s in v if s and str(s).strip()]
 
-
 # -------------------------------
-# 2) ICD seçeneklerini ver (checkbox'lar bunu çağıracak)
-# -------------------------------
-@app.get("/icd_list", response_class=JSONResponse)
-def icd_list_endpoint():
-    global _ICD_CACHE
-    if _ICD_CACHE is None:
-        try:
-            import pandas as pd
-            df = pd.read_excel(ICD_XLSX, sheet_name="DIM_ICD")
-            _ICD_CACHE = sorted(
-                [str(x).strip() for x in df["ICD"].dropna().unique().tolist() if str(x).strip()]
-            )
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"ICD listesi okunamadı: {e}")
-    return _ICD_CACHE
-
-
-# -------------------------------
-# 3) Ana Sayfa (checkbox + arama + metin fallback)
+# 2) Ana Sayfa (Power BI benzeri arayüz)
 # -------------------------------
 @app.get("/", response_class=HTMLResponse)
 def index():
     return """
-    <html>
-    <head>
-        <title>LOS Predictor</title>
-        <meta charset="utf-8">
-        <style>
-            body { font-family: Arial, sans-serif; max-width: 960px; margin: 40px auto;
-                   background: #2f2f2f; color: #eee; padding: 24px; border-radius: 12px; }
-            input, button, textarea { padding: 12px; margin-top: 8px; width: 100%; box-sizing: border-box;
-                            border-radius: 8px; border: 1px solid #555; background:#3b3b3b; color:#eee; }
-            textarea { min-height: 64px; }
-            button { background: #0a66ff; color: #fff; border: none; cursor: pointer; font-weight: 700; }
-            button:hover { background: #0a55d3; }
-            #result { font-size: 32px; font-weight: 800; margin-top: 16px; }
-            label { font-size: 12px; color: #bbb; display:block; margin-top: 8px; }
-            small { color:#b9a97c }
-            .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-            .pill { display:inline-block; background:#444; padding:4px 8px; border-radius:999px; margin:2px; font-size:12px;}
-            .box { background:#262626; padding:12px; border-radius:8px; border:1px solid #444; }
-            .list { max-height: 360px; overflow: auto; border:1px solid #555; border-radius:8px; padding:8px; background:#1e1e1e; }
-            .row { display:flex; align-items:center; gap:8px; margin:4px 0; }
-            .muted { color:#aaa; font-size:12px; }
-        </style>
-    </head>
-    <body>
-        <h2>LOS Tahmin Arayüzü</h2>
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8" />
+<title>LOS Tahmin Arayüzü</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root{
+    --glass: rgba(255,255,255,.85);
+    --text: #1f2937;
+    --muted:#6b7280;
+    --accent:#2563eb;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+    color:var(--text);
+    min-height:100vh;
+    background: #0b1725 url('https://images.unsplash.com/photo-1580281657527-47a2b90ac0e7?q=80&w=2070&auto=format&fit=crop') center/cover no-repeat fixed;
+  }
+  .wrap{ max-width:1100px; margin:40px auto; padding:24px; }
+  .panel{
+    backdrop-filter: blur(6px);
+    background: var(--glass);
+    border-radius: 14px;
+    padding: 24px;
+    box-shadow: 0 10px 30px rgba(0,0,0,.15);
+  }
+  h1{ font-size:28px; margin:0 0 16px 0; color:#111827}
+  .grid{ display:grid; grid-template-columns: 1fr; gap:16px; }
+  @media(min-width:900px){ .grid{ grid-template-columns: 1fr 1fr; } }
+  label{ font-size:13px; color:var(--muted); display:block; margin-bottom:6px; }
+  select, input[type="text"]{
+    width:100%; height:44px; padding:10px 12px; border-radius:10px; border:1px solid #e5e7eb; background:#fff;
+    outline:none;
+  }
+  select:focus, input:focus{ border-color:var(--accent); box-shadow: 0 0 0 3px rgba(37,99,235,.2); }
+  .card{
+    margin-top:22px; padding:26px; border:1px solid #e5e7eb; border-radius:14px; background:#fff;
+  }
+  .title{ font-size:14px; color:var(--muted); margin-bottom:8px;}
+  .value{ font-size:36px; font-weight:800; }
+  .btn{
+    height:46px; border:none; background:var(--accent); color:#fff; font-weight:700; border-radius:10px; cursor:pointer;
+  }
+  .btn:disabled{ opacity:.6; cursor:not-allowed; }
+  /* ICD multiselect */
+  .icd-box{ position:relative; }
+  .icd-search{ width:100%; height:44px; padding:10px 12px; border:1px solid #e5e7eb; border-radius:10px; }
+  .icd-list{
+    position:absolute; left:0; right:0; top:52px; max-height:260px; overflow:auto; border:1px solid #e5e7eb; background:#fff;
+    border-radius:10px; z-index:20; display:none;
+  }
+  .icd-item{ padding:8px 12px; display:flex; align-items:center; gap:10px; border-bottom:1px solid #f3f4f6; }
+  .icd-item:hover{ background:#f9fafb; }
+  .chipbar{ display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
+  .chip{ background:#eef2ff; color:#3730a3; padding:4px 8px; border-radius:999px; font-size:12px; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="panel">
+      <h1>LOS Tahmin Arayüzü</h1>
+      <div class="grid">
+        <div>
+          <label>Bölüm</label>
+          <select id="bolum"></select>
 
-        <div class="grid">
-          <div class="box">
-            <h3>ICD Seçici (Arama + Checkbox)</h3>
-            <input type="text" id="icd_search" placeholder="ICD ara (örn: K80)">
-            <div id="icd_list_box" class="list"></div>
-            <div id="picked" class="muted" style="margin-top:8px;"></div>
+          <label style="margin-top:14px;">Yaş Aralığı</label>
+          <select id="yas"></select>
+
+          <label style="margin-top:14px;">ICD (çoklu seçim)</label>
+          <div class="icd-box" id="icdBox">
+            <input id="icdSearch" class="icd-search" placeholder="ICD ara (örn: K80)" />
+            <div class="icd-list" id="icdList"></div>
           </div>
+          <div class="chipbar" id="chips"></div>
 
-          <div class="box">
-            <h3>Metin ile Giriş (opsiyonel)</h3>
-            <label>ICD Listesi (virgül / ; / | / boşluk ile ayırabilirsiniz):</label>
-            <textarea id="icd_text">K80.0</textarea>
-
-            <div class="grid">
-                <div>
-                    <label>Bölüm (ops.):</label>
-                    <input type="text" id="bolum" placeholder="örn. Kardiyoloji">
-                </div>
-                <div>
-                    <label>Yaş Grubu (ops.):</label>
-                    <input type="text" id="yas_grup" placeholder="örn. 0-1">
-                </div>
-            </div>
-
-            <button id="btn_predict">Tahmin Et</button>
-            <div id="result"></div>
-            <p class="muted">
-              Not: <code>/predict</code> sadece sayıyı döndürür. Tam JSON ve ANCHOR bilgileri için
-              <code>POST /predict_json</code> kullanın.
-            </p>
-          </div>
+          <button class="btn" id="btn">Tahmin Et</button>
         </div>
 
-        <script>
-        let ICD_OPTS = [];
-        let SELECTED = new Set();
+        <div>
+          <div class="card">
+            <div class="title">Tahmini Yatış (P50)</div>
+            <div class="value" id="result">Seçenekleri Doldurunuz</div>
+          </div>
+          <div class="card" style="margin-top:14px;">
+            <div class="title">Açıklama</div>
+            <div style="font-size:13px; color:#374151">
+              /predict sadece sayıyı döndürür. Tam JSON ve ANCHOR bilgileri için <code>POST /predict_json</code> kullanın.
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
 
-        // Metni güvenli şekilde ICD listesine çevir (virgül, noktalı virgül, tek/çift pipe ve boşluklar)
-        function parseIcdInput(raw) {
-            return (raw || "")
-              .replace(/\\|\\|/g, ",")                 // "||" -> ","
-              .split(/[\\,;|\\s]+/)                    // virgül/; / | / whitespace
-              .map(s => s.trim())
-              .filter(s => s.length > 0);
-        }
+<script>
+async function loadOptions(){
+  const res = await fetch('/options');
+  if(!res.ok) throw new Error('options yüklenemedi');
+  return res.json();
+}
 
-        function renderList(filter="") {
-            const box = document.getElementById("icd_list_box");
-            box.innerHTML = "";
-            const f = filter.trim().toLowerCase();
-            const items = f ? ICD_OPTS.filter(x => x.toLowerCase().includes(f)) : ICD_OPTS;
-            for (const code of items) {
-                const id = "chk_" + code.replace(/[^a-zA-Z0-9]/g, "_");
-                const row = document.createElement("div");
-                row.className = "row";
-                row.innerHTML = \`
-                    <input type="checkbox" id="\${id}" \${SELECTED.has(code) ? "checked": ""}>
-                    <label for="\${id}" style="margin:0;">\${code}</label>
-                \`;
-                const cb = row.querySelector("input");
-                cb.addEventListener("change", () => {
-                    if (cb.checked) SELECTED.add(code); else SELECTED.delete(code);
-                    renderPicked();
-                });
-                box.appendChild(row);
-            }
-        }
+// ---- ICD multiselect helpers
+const state = { icds: [] };
 
-        function renderPicked() {
-            const el = document.getElementById("picked");
-            if (SELECTED.size === 0) {
-                el.innerHTML = "<span class='muted'>Seçili ICD yok</span>";
-                return;
-            }
-            el.innerHTML = "<b>Seçilenler:</b> " + Array.from(SELECTED).sort()
-                .map(x => "<span class='pill'>" + x + "</span>").join(" ");
-        }
+function renderICDList(all){
+  const list = document.getElementById('icdList');
+  list.innerHTML = "";
+  all.forEach(code=>{
+    const row = document.createElement('div');
+    row.className = 'icd-item';
+    const cb = document.createElement('input'); cb.type='checkbox'; cb.value=code;
+    cb.checked = state.icds.includes(code);
+    cb.addEventListener('change', (e)=>{
+      if(e.target.checked){
+        if(!state.icds.includes(code)) state.icds.push(code);
+      }else{
+        state.icds = state.icds.filter(x=>x!==code);
+      }
+      renderChips();
+    });
+    const lbl = document.createElement('span'); lbl.textContent = code;
+    row.appendChild(cb); row.appendChild(lbl);
+    list.appendChild(row);
+  });
+}
 
-        async function loadICD() {
-            try {
-                const res = await fetch("/icd_list");
-                if (!res.ok) throw new Error("ICD listesi alınamadı");
-                ICD_OPTS = await res.json();
-                renderList();
-                renderPicked();
-            } catch (e) {
-                document.getElementById("icd_list_box").innerHTML =
-                    "<div class='muted'>ICD listesi yüklenemedi: " + e.message + "</div>";
-            }
-        }
+function renderChips(){
+  const bar = document.getElementById('chips');
+  bar.innerHTML = "";
+  state.icds.forEach(code=>{
+    const c = document.createElement('span');
+    c.className='chip'; c.textContent = code;
+    bar.appendChild(c);
+  });
+}
 
-        document.getElementById("icd_search").addEventListener("input", (e) => {
-            renderList(e.target.value || "");
-        });
+function attachICDSearch(all){
+  const box = document.getElementById('icdBox');
+  const input = document.getElementById('icdSearch');
+  const list = document.getElementById('icdList');
 
-        document.getElementById("btn_predict").addEventListener("click", async () => {
-            // checkbox + metin girişini birleştir
-            const fromChecks = Array.from(SELECTED);
-            const fromText   = parseIcdInput(document.getElementById("icd_text").value);
-            const icd = Array.from(new Set([...fromChecks, ...fromText]));
+  input.addEventListener('focus', ()=>{ list.style.display='block'; });
+  input.addEventListener('input', ()=>{
+    const q = input.value.trim().toLowerCase();
+    const filtered = all.filter(x=>x.toLowerCase().includes(q));
+    renderICDList(filtered);
+  });
+  document.addEventListener('click', (e)=>{
+    if(!box.contains(e.target)){ list.style.display='none'; }
+  });
+  renderICDList(all);
+}
 
-            if (icd.length === 0) {
-                document.getElementById("result").textContent = "Lütfen en az bir ICD seçin / girin.";
-                return;
-            }
+function fillSelect(sel, items, placeholder){
+  sel.innerHTML = "";
+  const opt0 = document.createElement('option');
+  opt0.value=""; opt0.textContent = placeholder || "Tümü";
+  sel.appendChild(opt0);
+  items.forEach(v=>{
+    const o=document.createElement('option'); o.value=v; o.textContent=v;
+    sel.appendChild(o);
+  });
+}
 
-            const bolum = (document.getElementById("bolum").value || "").trim();
-            const yas   = (document.getElementById("yas_grup").value || "").trim();
+(async ()=>{
+  try{
+    const opts = await loadOptions();
+    fillSelect(document.getElementById('bolum'), opts.bolum, 'Tümü');
+    fillSelect(document.getElementById('yas'), opts.yas_grup, 'Tümü');
+    attachICDSearch(opts.icd);
 
-            const body = { icd_list: icd, bolum: bolum || null, yas_grup: yas || null };
-            const resEl = document.getElementById("result");
-            resEl.textContent = "…";
+    document.getElementById('btn').addEventListener('click', async ()=>{
+      const bolum = document.getElementById('bolum').value || null;
+      const yas   = document.getElementById('yas').value || null;
+      const icd_list = state.icds.slice();
+      const resultEl = document.getElementById('result');
 
-            try {
-                const res = await fetch("/predict", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(body)
-                });
-                if (!res.ok) {
-                    const j = await res.json().catch(() => ({}));
-                    throw new Error(j.detail || ("HTTP " + res.status));
-                }
-                const text = await res.text();   // sadece sayı dönüyor
-                resEl.textContent = text;
-            } catch (err) {
-                resEl.textContent = "Hata: " + err.message;
-            }
-        });
+      if(icd_list.length===0){ resultEl.textContent = "ICD seçin"; return; }
 
-        // sayfa açılışında ICD’leri yükle
-        loadICD();
-        </script>
-    </body>
-    </html>
+      const res = await fetch('/predict', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ icd_list, bolum, yas_grup: yas })
+      });
+      if(!res.ok){
+        const j = await res.json().catch(()=>({}));
+        resultEl.textContent = "Hata: " + (j.detail || res.status);
+        return;
+      }
+      const text = await res.text();
+      resultEl.textContent = text;
+    });
+
+  }catch(err){
+    document.getElementById('result').textContent = "Hata: " + err.message;
+  }
+})();
+</script>
+</body>
+</html>
     """
 
-
 # -------------------------------
-# 4) Sağlık / bilgi
+# 3) Sağlık / bilgi
 # -------------------------------
 @app.get("/health")
 def health():
@@ -234,15 +253,51 @@ def info():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Hata: {e}")
 
+# -------------------------------
+# 3.5) Seçenek listeleri (Power BI benzeri dropdownlar için)
+# -------------------------------
+@app.get("/options", response_class=JSONResponse)
+def options():
+    """
+    LOOKUP_XLSX dosyasından:
+    - DIM_YASGRUP -> yas_grup listesi
+    - DIM_ICD -> icd listesi
+    - LKP_2D_FULL -> Bölüm listesi (unique)
+    """
+    try:
+        if not os.path.exists(LOOKUP_XLSX):
+            raise FileNotFoundError(f"{LOOKUP_XLSX} bulunamadı")
+        x = pd.ExcelFile(LOOKUP_XLSX)
+        # Yaş grupları
+        if "DIM_YASGRUP" in x.sheet_names:
+            yg = pd.read_excel(x, "DIM_YASGRUP")["YaşGrup"].dropna().astype(str).unique().tolist()
+        else:
+            yg = []
+        # ICD
+        if "DIM_ICD" in x.sheet_names:
+            icd = pd.read_excel(x, "DIM_ICD")["ICD"].dropna().astype(str).tolist()
+        else:
+            icd = []
+        # Bölüm (2D full'den unique)
+        if "LKP_2D_FULL" in x.sheet_names:
+            bol = pd.read_excel(x, "LKP_2D_FULL")["Bölüm"].dropna().astype(str).unique().tolist()
+        else:
+            bol = []
+
+        # Güzel bir sıralama: alfabetik
+        yg = sorted(yg, key=lambda s: (s[0].isdigit(), s))
+        bol = sorted(bol)
+        icd = sorted(icd)
+
+        return {"yas_grup": yg, "bolum": bol, "icd": icd}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"options hatası: {e}")
 
 # -------------------------------
-# 5) Tahmin (JSON → düz metin sayı)
+# 4) Tahmin (JSON → düz metin sayı)
 # -------------------------------
 @app.post("/predict", response_class=PlainTextResponse)
 def predict(req: PredictRequest):
-    """
-    Sadece sayısal değer döndürür (Pred_Final_Rounded).
-    """
     try:
         out = tahmin_et(req.icd_list, req.bolum, req.yas_grup)
         val = out.get("Pred_Final_Rounded", None)
@@ -252,24 +307,19 @@ def predict(req: PredictRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Hata: {e}")
 
-
 # -------------------------------
-# 6) Tam JSON isteyenler için
+# 5) Tam JSON isteyenler için
 # -------------------------------
 @app.post("/predict_json", response_class=JSONResponse)
 def predict_json(req: PredictRequest):
-    """
-    Tüm detayları (ANCHOR_SRC, ANCHOR_P50, model skorları, final harman) döndürür.
-    """
     try:
         out = app_predict(req.yas_grup or "", req.bolum or "", req.icd_list)
         return out
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Hata: {e}")
 
-
 # -------------------------------
-# 7) Form-POST isteyenler için alternatif (opsiyonel)
+# 6) Form-POST (opsiyonel)
 # -------------------------------
 @app.post("/tahmin", response_class=PlainTextResponse)
 def tahmin_form(
@@ -277,11 +327,7 @@ def tahmin_form(
     bolum: Optional[str] = Form(None),
     yas_grup: Optional[str] = Form(None),
 ):
-    """
-    Form gönderimiyle gelen tek satırlık metni robust şekilde parçalar ve tahmin döndürür.
-    """
     try:
-        # "A||B" ve tek |, ayrıca virgül/; ve boşlukları da ayrıştır
         icds = [s.strip() for s in re.split(r"[,\;\|\s]+", re.sub(r"\|\|", ",", icd_text or "")) if s.strip()]
         out = tahmin_et(icds, bolum, yas_grup)
         val = out.get("Pred_Final_Rounded", None)
@@ -291,9 +337,8 @@ def tahmin_form(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Hata: {e}")
 
-
 # -------------------------------
-# 8) Çalıştırıcı
+# 7) Çalıştırıcı
 # -------------------------------
 if __name__ == "__main__":
     import uvicorn
