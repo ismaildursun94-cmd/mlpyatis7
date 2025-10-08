@@ -1,0 +1,41 @@
+# ----- Python & venv -----
+__pycache__/
+*.py[cod]
+*.pyo
+.venv*/
+venv*/
+ENV*/
+.venv/
+env/
+
+# ----- OS / IDE -----
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
+.idea/
+
+# ----- Cache / Model indirmeleri -----
+.cache/
+.huggingface/
+huggingface/
+*.pt
+*.bin
+*.ckpt
+
+# ----- Native derleme artıkları -----
+*.dll
+*.so
+*.pyd
+*.o
+*.a
+
+# ----- Jupyter -----
+.ipynb_checkpoints/
+
+# ----- Excel kuralı -----
+# Varsayılan: tüm .xlsx'leri ignore et
+*.xlsx
+# Ama şu 2 dosyayı repo'ya dahil et
+!Veri2024.xlsx
+!LOS_Lookup_All.xlsx
