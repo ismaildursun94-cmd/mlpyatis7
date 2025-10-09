@@ -76,7 +76,8 @@ XGB_PARAMS = dict(
 
 STRICT_SHORT_CIRCUIT = True
 PREFER_TRAIN_FOR_EXACT = True
-USE_FULL_FOR_EXACT = False
+USE_FULL_FOR_EXACT = True          # ← FULL exact kısa devreyi kullan
+FULL_MIN_N = 1                     # ← N eşiği (FULL short-circuit için)
 # ====================================================
 
 __all__ = ["tahmin_et","app_predict","app_predict_many","app_info"]
@@ -257,9 +258,16 @@ else:
 def _winsorize_series(s: pd.Series, lo: float, hi: float) -> pd.Series:
     q_lo = s.quantile(lo); q_hi = s.quantile(hi)
     return s.clip(lower=q_lo, upper=q_hi)
+
 if WINSORIZE_ON:
     stage(f"Winsorize (train) - p{int(WINSOR_LO*100)} / p{int(WINSOR_HI*100)}")
     train_df["Yatış Gün Sayısı"] = _winsorize_series(train_df["Yatış Gün Sayısı"], WINSOR_LO, WINSOR_HI)
+
+# ---- (YENİ) FULL için winsorize edilmiş kopya
+df_full = df.copy()
+if WINSORIZE_ON:
+    stage(f"Winsorize (FULL) - p{int(WINSOR_LO*100)} / p{int(WINSOR_HI*100)}")
+    df_full["Yatış Gün Sayısı"] = _winsorize_series(df_full["Yatış Gün Sayısı"], WINSOR_LO, WINSOR_HI)
 
 # ================== 3) LOOKUP TABLOLARI ==================
 stage("Lookup tabloları (train + full)")
@@ -293,18 +301,18 @@ lkp0 = pd.DataFrame({
     "P90": [train_df["Yatış Gün Sayısı"].quantile(0.9)]
 })
 
-# ---- FULL lookuplar (birebir short-circuit garanti için)
-lkp3_full = (df.groupby(["YaşGrup","Bölüm","ICD_Set_Key"], as_index=False)
+# ---- FULL lookuplar (WINSORIZE EDİLMİŞ FULL ÜZERİNDEN)
+lkp3_full = (df_full.groupby(["YaşGrup","Bölüm","ICD_Set_Key"], as_index=False)
              .agg(N=("Yatış Gün Sayısı","count"),
                   P50=("Yatış Gün Sayısı","median")))
 lkp3_full["ICD_Set_Key"] = lkp3_full["ICD_Set_Key"].apply(clean_icd_set_key)
 
-lkp2_full = (df.groupby(["Bölüm","ICD_Set_Key"], as_index=False)
+lkp2_full = (df_full.groupby(["Bölüm","ICD_Set_Key"], as_index=False)
              .agg(N=("Yatış Gün Sayısı","count"),
                   P50=("Yatış Gün Sayısı","median")))
 lkp2_full["ICD_Set_Key"] = lkp2_full["ICD_Set_Key"].apply(clean_icd_set_key)
 
-lkp1_full = (df.groupby(["ICD_Set_Key"], as_index=False)
+lkp1_full = (df_full.groupby(["ICD_Set_Key"], as_index=False)
              .agg(N=("Yatış Gün Sayısı","count"),
                   P50=("Yatış Gün Sayısı","median")))
 lkp1_full["ICD_Set_Key"] = lkp1_full["ICD_Set_Key"].apply(clean_icd_set_key)
@@ -393,7 +401,7 @@ lkp1_map = {r["ICD_Set_Key"]:(r["P50"], r["N"]) for _,r in lkp1.iterrows()}
 lkp0_p50 = float(lkp0["P50"].iloc[0]) if len(lkp0)>0 else 0.0
 lkp0_p90 = float(lkp0["P90"].iloc[0]) if len(lkp0)>0 else 0.0
 
-# FULL mapler (sadece exact-match short-circuit için)
+# FULL mapler (sadece exact-match short-circuit için; WINSORIZE edilmiş df_full'den)
 lkp3_full_map = {(r["YaşGrup"], r["Bölüm"], r["ICD_Set_Key"]):(r["P50"], r["N"]) for _,r in lkp3_full.iterrows()}
 lkp2_full_map = {(r["Bölüm"], r["ICD_Set_Key"]):(r["P50"], r["N"]) for _,r in lkp2_full.iterrows()}
 lkp1_full_map = {r["ICD_Set_Key"]:(r["P50"], r["N"]) for _,r in lkp1_full.iterrows()}
@@ -413,12 +421,7 @@ def find_anchor(yg: str, bolum: str, key: str):
     train_2d = lkp2_map.get((bolum, key))
     train_1d = lkp1_map.get(key)
 
-    # --- FULL tarafı ---
-    full_3d  = lkp3_full_map.get((yg, bolum, key))
-    full_2d  = lkp2_full_map.get((bolum, key))
-    full_1d  = lkp1_full_map.get(key)
-
-    # KATI ÖNCELİK: TRAIN 1D > TRAIN 2D > TRAIN 3D > FULL 1D > FULL 2D > FULL 3D
+    # Öncelik: TRAIN 1D > TRAIN 2D > TRAIN 3D
     if train_1d is not None:
         p50, n = train_1d
         return "1D_TRAIN", float(p50), int(n), key
@@ -429,15 +432,25 @@ def find_anchor(yg: str, bolum: str, key: str):
         p50, n = train_3d
         return "3D_TRAIN", float(p50), int(n), key
 
-    if full_1d is not None:
-        p50, n = full_1d
-        return "1D_FULL", float(p50), int(n), key
-    if full_2d is not None:
-        p50, n = full_2d
-        return "2D_FULL", float(p50), int(n), key
-    if full_3d is not None:
-        p50, n = full_3d
-        return "3D_FULL", float(p50), int(n), key
+    # --- FULL tarafı (YENİ: winsorize edilmiş df_full + N eşiği) ---
+    if USE_FULL_FOR_EXACT:
+        full_1d = lkp1_full_map.get(key)
+        if full_1d is not None:
+            p50, n = full_1d
+            if int(n) >= int(FULL_MIN_N):
+                return "1D_FULL", float(p50), int(n), key
+
+        full_2d = lkp2_full_map.get((bolum, key))
+        if full_2d is not None:
+            p50, n = full_2d
+            if int(n) >= int(FULL_MIN_N):
+                return "2D_FULL", float(p50), int(n), key
+
+        full_3d = lkp3_full_map.get((yg, bolum, key))
+        if full_3d is not None:
+            p50, n = full_3d
+            if int(n) >= int(FULL_MIN_N):
+                return "3D_FULL", float(p50), int(n), key
 
     return (None, None, 0, None)
 
