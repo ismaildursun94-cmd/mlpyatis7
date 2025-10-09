@@ -1,4 +1,6 @@
+# los_predict_no_cap.py
 # -*- coding: utf-8 -*-
+
 import os, json, re, warnings, datetime, itertools, math, random, unicodedata
 from decimal import Decimal, ROUND_HALF_UP
 from collections import defaultdict, Counter
@@ -9,16 +11,16 @@ import numpy as np
 from sklearn.model_selection import train_test_split
 from scipy import sparse
 from scipy.sparse import hstack
-
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.preprocessing import OneHotEncoder, MultiLabelBinarizer
 from xgboost import XGBRegressor
+
 try:
     from sentence_transformers import SentenceTransformer
 except Exception:
     SentenceTransformer = None
-import joblib
 
+import joblib
 try:
     from tqdm.auto import tqdm
 except Exception:
@@ -26,58 +28,56 @@ except Exception:
 
 warnings.filterwarnings("ignore", category=UserWarning)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-random.seed(42)
-np.random.seed(42)
+random.seed(42); np.random.seed(42)
 
 # ====================== AYARLAR ======================
-EXCEL_PATH = "Veri2024.xlsx"
-LOOKUP_XLSX = "LOS_Lookup_All.xlsx"
-MODEL_DIR = "model_out"
-MAKE_YENI_VAKALAR = True
-YENI_VAKALAR_XLSX = "YeniVakalar.xlsx"
-PRED_LOS_XLSX = "PRED_LOS.xlsx"
-VALID_PRED_XLSX = "VALID_PREDICTIONS.xlsx"
-N_SAMPLES_YENI = 200
-REQUIRE_ICD = True
+EXCEL_PATH         = "Veri2024.xlsx"
+LOOKUP_XLSX        = "LOS_Lookup_All.xlsx"
+MODEL_DIR          = "model_out"
+
+MAKE_YENI_VAKALAR  = True
+YENI_VAKALAR_XLSX  = "YeniVakalar.xlsx"
+PRED_LOS_XLSX      = "PRED_LOS.xlsx"
+VALID_PRED_XLSX    = "VALID_PREDICTIONS.xlsx"
+
+N_SAMPLES_YENI     = 200
+REQUIRE_ICD        = True
 FALLBACK_FROM_TEXT = True
-RANDOM_SEED = 42
-TOPK_ICD = 400
-MIN_SUPPORT = 1
+RANDOM_SEED        = 42
 
-SPLIT_BY_COMBO = False   # False: row-split (valid'de 3D mümkün)
+TOPK_ICD           = 400
+MIN_SUPPORT        = 1
 
-SATURATION_ON = True
-SATURATION_K = 3.0
+SPLIT_BY_COMBO     = False  # False: row-split (valid'de 3D mümkün)
 
-TOPK_NEIGHBORS = 10
-RHO_J = 1.2
+SATURATION_ON      = True
+SATURATION_K       = 3.0
 
+TOPK_NEIGHBORS     = 10
+RHO_J              = 1.2
 SHRINK_1SUPPORT_SCALE = 0.15
-REMOVAL_PENALTY = 0.5
-CAP_MARJ = 1.0
+REMOVAL_PENALTY    = 0.5
 
-WINSORIZE_ON = True
-WINSOR_LO = 0.00973
-WINSOR_HI = 0.9785
+# CAP marjı lookup/raporlama için hesaplanmaya devam ediyor, ama TAHMİNDE kullanılmıyor
+CAP_MARJ           = 1.0
 
-XGB_ENS_ON = True
-XGB_ALPHA_LOG = 0.20
-XGB_RULE_BLEND = 0.00
+WINSORIZE_ON       = True
+WINSOR_LO          = 0.00973
+WINSOR_HI          = 0.9785
+
+XGB_ENS_ON         = True
+XGB_ALPHA_LOG      = 0.20
+XGB_RULE_BLEND     = 0.00
 XGB_PARAMS = dict(
-    n_estimators=400,
-    learning_rate=0.05,
-    max_depth=6,
-    subsample=0.8,
-    colsample_bytree=0.8,
-    random_state=RANDOM_SEED,
-    n_jobs=4,
-    tree_method="hist"
+    n_estimators=400, learning_rate=0.05, max_depth=6,
+    subsample=0.8, colsample_bytree=0.8,
+    random_state=RANDOM_SEED, n_jobs=4, tree_method="hist"
 )
 
-STRICT_SHORT_CIRCUIT = True
+STRICT_SHORT_CIRCUIT   = True
 PREFER_TRAIN_FOR_EXACT = False
-USE_FULL_FOR_EXACT = True          # FULL exact kısa devre
-FULL_MIN_N = 1                     # FULL short-circuit N eşiği
+USE_FULL_FOR_EXACT     = True   # FULL exact kısa devre
+FULL_MIN_N             = 1      # FULL short-circuit N eşiği
 # ====================================================
 
 __all__ = ["tahmin_et","app_predict","app_predict_many","app_info"]
@@ -101,7 +101,7 @@ def yas_to_years(val):
     if isinstance(val, (int, float)): return float(val)
     s = str(val).strip().lower()
     if re.fullmatch(r"\d+(?:[.,]\d+)?", s): return float(s.replace(",", "."))
-    yil = re.findall(r"(\d+)\s*yıl", s); ay  = re.findall(r"(\d+)\s*ay", s); gun = re.findall(r"(\d+)\s*gün", s)
+    yil = re.findall(r"(\d+)\s*yıl", s); ay = re.findall(r"(\d+)\s*ay", s); gun = re.findall(r"(\d+)\s*gün", s)
     years = 0.0
     if yil: years += sum(float(x) for x in yil)
     if ay:  years += sum(float(x) for x in ay) / 12
@@ -109,8 +109,8 @@ def yas_to_years(val):
     if years == 0.0 and not (yil or ay or gun): return pd.NA
     return round(years, 2)
 
-_PAREN_MAP = str.maketrans({'（':'(', '）':')', '【':'[', '】':']', '＜':'<', '＞':'>', '｛':'{', '｝':'}'})
-_PREFIX_RE = re.compile(r"""^\s*[\(\[\{\<]\s*(?:ö|ö|k|a)\s*[\)\]\}\>]\s*""", re.IGNORECASE | re.VERBOSE)
+_PAREN_MAP   = str.maketrans({'（':'(', '）':')', '【':'[', '】':']', '＜':'<', '＞':'>', '｛':'{', '｝':'}'})
+_PREFIX_RE   = re.compile(r"""^\s*[\(\[\{\<]\s*(?:ö|ö|k|a)\s*[\)\]\}\>]\s*""", re.IGNORECASE | re.VERBOSE)
 _ANYWHERE_TAG_RE = re.compile(r"\(\s*(?:ö|ö|k|a)\s*\)", re.IGNORECASE)
 _ICD_CODE_RE = re.compile(r"\b([A-Z][0-9]{2}(?:\.[A-Z0-9]{1,4})?)\b", re.IGNORECASE)
 
@@ -160,8 +160,8 @@ def yas_to_group(y):
     if pd.isna(y): return pd.NA
     y = float(y)
     if y < 0: return pd.NA
-    if y <= 1:  return "0-1"
-    if y <= 5:  return "2-5"
+    if y <= 1: return "0-1"
+    if y <= 5: return "2-5"
     if y <= 10: return "5-10"
     if y <= 15: return "10-15"
     if y <= 25: return "15-25"
@@ -179,11 +179,9 @@ def as_set(key:str)->set:
     if not key: return set()
     return set([k for k in key.split("||") if k])
 
-def as_key(s:set)->str:
-    return "||".join(sorted(s))
+def as_key(s:set)->str: return "||".join(sorted(s))
 
-def as_csr(x):
-    return x if sparse.issparse(x) else sparse.csr_matrix(x)
+def as_csr(x): return x if sparse.issparse(x) else sparse.csr_matrix(x)
 
 # ================== 1) YÜKLE & TEMİZLE ==================
 stage("Excel okunuyor")
@@ -198,6 +196,7 @@ if "Yaş" in df.columns:
     df["Yaş"] = df["Yaş"].apply(yas_to_years)
 else:
     df["Yaş"] = pd.NA
+
 df["Yatış Gün Sayısı"] = pd.to_numeric(df["Yatış Gün Sayısı"], errors="coerce")
 df = df[df["Yatış Gün Sayısı"] > 0].copy()
 
@@ -219,7 +218,7 @@ df["ICD_Set_Key"] = df["ICD_Set_Key"].apply(clean_icd_set_key)
 df["ICD_Sayısı"] = df["ICD_List_Norm"].apply(len)
 df = df[~(REQUIRE_ICD & (df["ICD_Sayısı"]==0))].copy()
 
-# Embedding metni (opsiyonel kaynak)
+# Embedding metni
 base_text_col = "ICD Adi Ve Kodu" if "ICD Adi Ve Kodu" in df.columns else "ICD Kodu"
 df["ICD_Text_Embed"] = df[base_text_col].map(clean_text_anywhere_tags).fillna("")
 
@@ -230,6 +229,7 @@ df["YaşGrup"] = df["Yaş"].apply(yas_to_group)
 # --- Demo kanonik sözlükleri ---
 YG_UNIQ = { _norm_text_basic(v): v for v in df["YaşGrup"].dropna().astype(str).unique() }
 BOLUM_UNIQ = { _norm_text_basic(v): v for v in df["Bölüm"].dropna().astype(str).unique() }
+
 def canon_demo(yas_grup: str, bolum: str) -> tuple[str,str]:
     yg = YG_UNIQ.get(_norm_text_basic(yas_grup), str(yas_grup or "").strip())
     b  = BOLUM_UNIQ.get(_norm_text_basic(bolum), str(bolum or "").strip())
@@ -272,7 +272,7 @@ if WINSORIZE_ON:
 # ================== 3) LOOKUP TABLOLARI ==================
 stage("Lookup tabloları (train + full)")
 
-# ---- TRAIN lookuplar
+# ---- TRAIN lookuplar (P90 sütunları RAPOR için kalır)
 lkp3 = (train_df.groupby(["YaşGrup","Bölüm","ICD_Set_Key"], as_index=False)
         .agg(N=("Yatış Gün Sayısı","count"),
              Ortalama=("Yatış Gün Sayısı", lambda x: round_half_up(x.mean())),
@@ -303,18 +303,15 @@ lkp0 = pd.DataFrame({
 
 # ---- FULL lookuplar (WINSORIZE EDİLMİŞ FULL ÜZERİNDEN)
 lkp3_full = (df_full.groupby(["YaşGrup","Bölüm","ICD_Set_Key"], as_index=False)
-             .agg(N=("Yatış Gün Sayısı","count"),
-                  P50=("Yatış Gün Sayısı","median")))
+             .agg(N=("Yatış Gün Sayısı","count"), P50=("Yatış Gün Sayısı","median")))
 lkp3_full["ICD_Set_Key"] = lkp3_full["ICD_Set_Key"].apply(clean_icd_set_key)
 
 lkp2_full = (df_full.groupby(["Bölüm","ICD_Set_Key"], as_index=False)
-             .agg(N=("Yatış Gün Sayısı","count"),
-                  P50=("Yatış Gün Sayısı","median")))
+             .agg(N=("Yatış Gün Sayısı","count"), P50=("Yatış Gün Sayısı","median")))
 lkp2_full["ICD_Set_Key"] = lkp2_full["ICD_Set_Key"].apply(clean_icd_set_key)
 
 lkp1_full = (df_full.groupby(["ICD_Set_Key"], as_index=False)
-             .agg(N=("Yatış Gün Sayısı","count"),
-                  P50=("Yatış Gün Sayısı","median")))
+             .agg(N=("Yatış Gün Sayısı","count"), P50=("Yatış Gün Sayısı","median")))
 lkp1_full["ICD_Set_Key"] = lkp1_full["ICD_Set_Key"].apply(clean_icd_set_key)
 
 # Tekil / pair yardımcı tablolar (train)
@@ -326,15 +323,17 @@ pairs = train_df[train_df["ICD_Sayısı"]==2].copy()
 pairs["PairKey"] = pairs["ICD_List_Norm"].apply(lambda lst: "||".join(sorted(lst)))
 LKP_PAIR = pairs.groupby(["YaşGrup","Bölüm","PairKey"])["Yatış Gün Sayısı"].agg(N="count", P50="median").reset_index()
 
-DEMO_P90_MAP = train_df.groupby(["YaşGrup","Bölüm"])["Yatış Gün Sayısı"].quantile(0.9).reset_index().rename(columns={"Yatış Gün Sayısı":"P90"})
+DEMO_P90_MAP = (train_df.groupby(["YaşGrup","Bölüm"])["Yatış Gün Sayısı"]
+                .quantile(0.9).reset_index().rename(columns={"Yatış Gün Sayısı":"P90"}))
 demop90_map = {(r["YaşGrup"], r["Bölüm"]): float(r["P90"]) for _, r in DEMO_P90_MAP.iterrows()}
 
 # ================== 4) β / γ ÖĞREN ==================
 stage("β/γ öğreniliyor")
 icd_to_beta_samples = defaultdict(list)
+
 ctx3 = lkp3.copy(); ctx3["Set"] = ctx3["ICD_Set_Key"].apply(as_set)
-one_map = dict(zip(lkp1["ICD_Set_Key"], lkp1["P50"]))
-single_map = dict(zip(LKP_ICD["ICD_Kod"], LKP_ICD["P50"]))
+one_map    = dict(zip(lkp1["ICD_Set_Key"], lkp1["P50"]))
+single_map = dict(zip(LKP_ICD["ICD_Kod"],   LKP_ICD["P50"]))
 
 for _, row in ctx3.iterrows():
     key, p50 = row["ICD_Set_Key"], row["P50"]
@@ -361,6 +360,7 @@ for _, row in LKP_PAIR.iterrows():
     delta = max(0.0, float(p50) - float(base))
     pair_to_gamma_samples[(i,j)].append(delta)
     pair_to_gamma_samples[(j,i)].append(delta)
+
 gamma_pairs, gamma_support = {}, {}
 for pair, samples in pair_to_gamma_samples.items():
     if len(samples) >= MIN_SUPPORT:
@@ -370,7 +370,10 @@ for pair, samples in pair_to_gamma_samples.items():
 # ================== 5) LOOKUP EXCEL ==================
 stage("Lookup Excel yazılıyor")
 _br_base = df[["ICD_Set_Key","ICD_List_Norm"]].copy()
-BR_ICDSET_MAP = _br_base.explode("ICD_List_Norm").rename(columns={"ICD_List_Norm":"ICD"}).dropna(subset=["ICD"]).drop_duplicates().reset_index(drop=True)
+BR_ICDSET_MAP = (_br_base.explode("ICD_List_Norm")
+                 .rename(columns={"ICD_List_Norm":"ICD"})
+                 ).dropna(subset=["ICD"]).drop_duplicates().reset_index(drop=True)
+
 DIM_ICD = pd.DataFrame({"ICD": sorted({icd for lst in df["ICD_List_Norm"] for icd in lst})})
 _age_order = ["0-1","2-5","5-10","10-15","15-25","25-35","35-50","50-65","65+"]
 _present = [yg for yg in _age_order if yg in set(df["YaşGrup"].dropna().astype(str).unique())]
@@ -381,9 +384,11 @@ with pd.ExcelWriter(LOOKUP_XLSX, engine="xlsxwriter") as w:
     lkp2.to_excel(w, index=False, sheet_name="LKP_2D_TRAIN")
     lkp1.to_excel(w, index=False, sheet_name="LKP_1D_TRAIN")
     lkp0.to_excel(w, index=False, sheet_name="LKP_0D_TRAIN")
+
     lkp3_full.to_excel(w, index=False, sheet_name="LKP_3D_FULL")
     lkp2_full.to_excel(w, index=False, sheet_name="LKP_2D_FULL")
     lkp1_full.to_excel(w, index=False, sheet_name="LKP_1D_FULL")
+
     LKP_ICD.to_excel(w, index=False, sheet_name="LKP_ICD_TRAIN")
     df[["ICD_Text_Embed"]].to_excel(w, index=False, sheet_name="TEXT_EMB_SOURCE")
     BR_ICDSET_MAP.to_excel(w, index=False, sheet_name="BR_ICDSET_MAP")
@@ -398,8 +403,9 @@ stage("Prediction yardımcı yapılar")
 lkp3_map = {(r["YaşGrup"], r["Bölüm"], r["ICD_Set_Key"]):(r["P50"], r["N"]) for _,r in lkp3.iterrows()}
 lkp2_map = {(r["Bölüm"], r["ICD_Set_Key"]):(r["P50"], r["N"]) for _,r in lkp2.iterrows()}
 lkp1_map = {r["ICD_Set_Key"]:(r["P50"], r["N"]) for _,r in lkp1.iterrows()}
+
 lkp0_p50 = float(lkp0["P50"].iloc[0]) if len(lkp0)>0 else 0.0
-lkp0_p90 = float(lkp0["P90"].iloc[0]) if len(lkp0)>0 else 0.0
+lkp0_p90 = float(lkp0["P90"].iloc[0]) if len(lkp0)>0 else 0.0  # raporda var
 
 # FULL mapler (exact & guardrails; WINSORIZE edilmiş full)
 lkp3_full_map = {(r["YaşGrup"], r["Bölüm"], r["ICD_Set_Key"]):(r["P50"], r["N"]) for _,r in lkp3_full.iterrows()}
@@ -458,65 +464,58 @@ def _topk_weighted_anchor(candidates, target_set:set, K:int=TOPK_NEIGHBORS, rho:
     scored = []
     for key, p50, n in candidates:
         J = jaccard(target_set, as_set(key))
-        if p50 is None:
-            continue
+        if p50 is None: continue
         scored.append((J, float(p50), int(n if n is not None else 0), key))
-
-    if not scored:
-        return 0.0, None, None
-
+    if not scored: return 0.0, None, None
     scored.sort(key=lambda x: (x[0], x[2], x[1]), reverse=True)
     bestJ, bestP50, _bestN, bestKey = scored[0]
-
-    # Hiç örtüşme yoksa (J=0) komşu yok
-    if bestJ <= 0.0:
+    if bestJ <= 0.0:  # hiç örtüşme yoksa komşu yok
         return 0.0, None, None
-
     topk = [r for r in scored if r[0] > 0.0][:K]
     Wvals = [(((J**float(rho)) * math.log1p(max(0, n))), p50) for J, p50, n, _k in topk]
     W = sum(w for w, _ in Wvals)
-    if W <= 0:
-        return bestJ, bestP50, bestKey
+    if W <= 0: return bestJ, bestP50, bestKey
     wmean = sum(p * w for w, p in Wvals) / W
     return bestJ, float(wmean), bestKey
 
 def nearest_neighbor_anchor(yg:str, bolum:str, target_key:str):
     target = as_set(target_key)
-
     # 3D
     cand3 = [(key, *lkp3_map.get((yg, bolum, key), (None, 0))) for key in ctx3_by_demo.get((yg, bolum), [])]
     bestJ, w_p50, bestKey = _topk_weighted_anchor(cand3, target)
     if bestKey is not None:
         return bestJ, float(w_p50 if w_p50 is not None else lkp0_p50), bestKey, "3D_DEMO"
-
     # 2D
     cand2 = [(key, p50, n) for (b, key), (p50, n) in lkp2_map.items() if b == bolum]
     bestJ, w_p50, bestKey = _topk_weighted_anchor(cand2, target)
     if bestKey is not None:
         return bestJ, float(w_p50 if w_p50 is not None else lkp0_p50), bestKey, "2D"
-
     # 1D
     cand1 = [(key, p50, n) for key, (p50, n) in lkp1_map.items()]
     bestJ, w_p50, bestKey = _topk_weighted_anchor(cand1, target)
     if bestKey is not None:
         return bestJ, float(w_p50 if w_p50 is not None else lkp0_p50), bestKey, "1D"
-
     return 0.0, 0.0, None, "NONE"
 
 def model_contrib(target_key:str, anchor_key:str):
     T = as_set(target_key); A = as_set(anchor_key) if anchor_key else set()
+
     def beta_scaled(icd):
         val = max(0.0, beta_icd.get(icd, 0.0)); sup = beta_support.get(icd, 0)
         return val * (1.0 if sup>=3 else SHRINK_1SUPPORT_SCALE)
+
     def gamma_scaled(i,j):
         val = max(0.0, gamma_pairs.get((i,j), gamma_pairs.get((j,i), 0.0)))
         sup = max(gamma_support.get((i,j),0), gamma_support.get((j,i),0))
         return val * (1.0 if sup>=3 else SHRINK_1SUPPORT_SCALE)
+
     add_single = sorted(T - A); rem_single = sorted(A - T)
-    beta_sum = sum(beta_scaled(i) for i in add_single) - REMOVAL_PENALTY*sum(beta_scaled(i) for i in rem_single)
+    beta_sum  = sum(beta_scaled(i) for i in add_single) - REMOVAL_PENALTY*sum(beta_scaled(i) for i in rem_single)
+
     pairs_T = set(itertools.combinations(sorted(T),2)); pairs_A = set(itertools.combinations(sorted(A),2))
     add_pairs = pairs_T - pairs_A; rem_pairs = pairs_A - pairs_T
     gamma_sum = sum(gamma_scaled(i,j) for (i,j) in add_pairs) - REMOVAL_PENALTY*sum(gamma_scaled(i,j) for (i,j) in rem_pairs)
+
     return beta_sum, gamma_sum, add_single
 
 def saturation(total_add:float, k:float=SATURATION_K):
@@ -553,14 +552,16 @@ def guardrails(yg:str, bolum:str, target_key:str, pred:float):
 
 def predict_one(yg:str, bolum:str, target_key:str):
     yg, bolum = canon_demo(yg, bolum)
-
     src, anchor_p50, n, anchor_key = find_anchor(yg, bolum, target_key)
 
     # Birebir eşleşme → short-circuit
     if anchor_p50 is not None and anchor_key == target_key and not str(src).startswith("NEIGHBOR"):
-        meta = {"ANCHOR_SRC": src, "ANCHOR_KEY": anchor_key or "", "ANCHOR_P50": float(anchor_p50),
-                "ALPHA_JACCARD": 0.0, "ADDED_ICDS": "", "BETA_SUM": 0.0, "GAMMA_SUM": 0.0,
-                "MODEL_PRED": float(anchor_p50), "PRED_BLEND": float(anchor_p50), "SHORT_CIRCUIT": True}
+        meta = {
+            "ANCHOR_SRC": src, "ANCHOR_KEY": anchor_key or "", "ANCHOR_P50": float(anchor_p50),
+            "ALPHA_JACCARD": 0.0, "ADDED_ICDS": "", "BETA_SUM": 0.0, "GAMMA_SUM": 0.0,
+            "MODEL_PRED": float(anchor_p50), "PRED_BLEND": float(anchor_p50),
+            "SHORT_CIRCUIT": True, "CAP_APPLIED": False
+        }
         return float(anchor_p50), meta
 
     # Anchor yoksa komşu
@@ -575,24 +576,32 @@ def predict_one(yg:str, bolum:str, target_key:str):
     model_pred = float(anchor_p50) + add_total
     pred_blend = (1.0 - alpha) * model_pred + alpha * float(anchor_p50)
 
-    # Guardrails uygula (TRAIN + FULL)
+    # Guardrails uygula (alt sınırlar)
     pred_guarded = guardrails(yg, bolum, target_key, pred_blend)
 
     # 1 gün altı saçmalığı engelle
     pred_final = float(anchor_p50) if pred_guarded < 1.0 else pred_guarded
 
-    # Üstten cap (demo P90)
-    cap_ref = demop90_map.get((yg, bolum), lkp0_p90)
-    cap_val = float(cap_ref) * float(CAP_MARJ) if cap_ref is not None else float("inf")
-    if cap_val is not None:
-        pred_final = min(float(pred_final), float(cap_val))
+    # IMPORTANT: Üstten cap (demo P90) artık UYGULANMIYOR.
+    # cap_ref = demop90_map.get((yg, bolum), None)
+    # if cap_ref is not None:
+    #     cap_val = float(cap_ref) * float(CAP_MARJ)
+    #     pred_final = min(float(pred_final), float(cap_val))
 
-    meta = {"ANCHOR_SRC": src, "ANCHOR_KEY": anchor_key or "", "ANCHOR_P50": float(anchor_p50),
-            "ALPHA_JACCARD": float(alpha), "ADDED_ICDS": ",".join(added_icds),
-            "BETA_SUM": float(beta_sum), "GAMMA_SUM": float(gamma_sum),
-            "MODEL_PRED": float(model_pred), "PRED_BLEND": float(pred_blend),
-            "PRED_AFTER_GUARDRAILS": float(pred_guarded),
-            "SHORT_CIRCUIT": False}
+    meta = {
+        "ANCHOR_SRC": src,
+        "ANCHOR_KEY": anchor_key or "",
+        "ANCHOR_P50": float(anchor_p50),
+        "ALPHA_JACCARD": float(alpha),
+        "ADDED_ICDS": ",".join(added_icds),
+        "BETA_SUM": float(beta_sum),
+        "GAMMA_SUM": float(gamma_sum),
+        "MODEL_PRED": float(model_pred),
+        "PRED_BLEND": float(pred_blend),
+        "PRED_AFTER_GUARDRAILS": float(pred_guarded),
+        "SHORT_CIRCUIT": False,
+        "CAP_APPLIED": False
+    }
     return float(pred_final), meta
 
 # ================== 7) MODEL ARTEFAKTLARI ==================
@@ -604,8 +613,10 @@ with open(os.path.join(MODEL_DIR, "gamma_pairs.json"), "w", encoding="utf-8") as
     json.dump({f"{i}||{j}":v for (i,j), v in gamma_pairs.items()}, f, ensure_ascii=False, indent=2)
 with open(os.path.join(MODEL_DIR, "config.json"), "w", encoding="utf-8") as f:
     json.dump({"created_at": datetime.datetime.now().isoformat(),
-               "min_support": MIN_SUPPORT, "saturation_on": SATURATION_ON,
-               "saturation_k": SATURATION_K, "notes": "Cinsiyetsiz β/γ; α=Jaccard; guardrails aktif"},
+               "min_support": MIN_SUPPORT,
+               "saturation_on": SATURATION_ON,
+               "saturation_k": SATURATION_K,
+               "notes": "Cinsiyetsiz β/γ; α=Jaccard; guardrails aktif; CAP devre dışı"},
               f, ensure_ascii=False, indent=2)
 
 # ================== 7.5) XGB ENSEMBLE ==================
@@ -613,28 +624,35 @@ if XGB_ENS_ON:
     stage("XGB (plain+log) eğitiliyor")
     icd_counts = Counter([icd for lst in train_df["ICD_List_Norm"] for icd in lst])
     XGB_TOP_ICDS = [icd for icd,_ in icd_counts.most_common(TOPK_ICD)]
+
     try:
         ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=True)
     except TypeError:
         ohe = OneHotEncoder(handle_unknown="ignore", sparse=True)
     ohe.fit(train_df[["Bölüm","YaşGrup"]])
+
     mlb = MultiLabelBinarizer(classes=XGB_TOP_ICDS, sparse_output=True); mlb.fit([XGB_TOP_ICDS])
+
     def _pack_features(df_part: pd.DataFrame):
         X_cat = ohe.transform(df_part[["Bölüm","YaşGrup"]])
         icd_lists = df_part["ICD_List_Norm"].apply(lambda lst: [c for c in lst if c in XGB_TOP_ICDS])
         X_icd = mlb.transform(icd_lists)
         x_icd_count = np.asarray(df_part["ICD_Sayısı"]).reshape(-1,1)
         return hstack([X_cat, X_icd, x_icd_count], format="csr")
+
     X_train = _pack_features(train_df)
     y_train = train_df["Yatış Gün Sayısı"].astype(float).values
-    y_log = np.log1p(y_train)
+    y_log   = np.log1p(y_train)
+
     xgb_plain = XGBRegressor(**XGB_PARAMS); xgb_log = XGBRegressor(**XGB_PARAMS)
     xgb_plain.fit(X_train, y_train); xgb_log.fit(X_train, y_log)
+
     joblib.dump(xgb_plain, os.path.join(MODEL_DIR,"xgb_plain.joblib"))
     joblib.dump(xgb_log,   os.path.join(MODEL_DIR,"xgb_log.joblib"))
     joblib.dump(ohe,       os.path.join(MODEL_DIR,"xgb_ohe.joblib"))
     joblib.dump(mlb,       os.path.join(MODEL_DIR,"xgb_mlb.joblib"))
     joblib.dump(XGB_TOP_ICDS, os.path.join(MODEL_DIR,"xgb_top_icds.joblib"))
+
     def xgb_predict_ens(yg, bolum, key, icd_list_norm=None):
         if icd_list_norm is None:
             icd_list_norm = key.split("||") if key else []
@@ -645,16 +663,19 @@ if XGB_ENS_ON:
         p_ens = (1.0 - float(XGB_ALPHA_LOG)) * p_plain + float(XGB_ALPHA_LOG) * p_log
         return p_plain, p_log, p_ens
 else:
-    def xgb_predict_ens(yg, bolum, key, icd_list_norm=None): return np.nan, np.nan, np.nan
+    def xgb_predict_ens(yg, bolum, key, icd_list_norm=None):
+        return np.nan, np.nan, np.nan
 
 # ================== 8) PRED_LOS ==================
 stage("PRED_LOS.xlsx üretiliyor")
 uniq_combos_df = df[["YaşGrup","Bölüm","ICD_Set_Key"]].drop_duplicates().reset_index(drop=True)
+
 pred_rows=[]
 for r in tqdm(uniq_combos_df.itertuples(), total=len(uniq_combos_df), desc="PRED_LOS"):
     pred_rule, meta = predict_one(r.YaşGrup, r.Bölüm, r.ICD_Set_Key)
     icd_list_norm = r.ICD_Set_Key.split("||") if isinstance(r.ICD_Set_Key, str) and r.ICD_Set_Key else []
     p_plain, p_log, p_ens = xgb_predict_ens(r.YaşGrup, r.Bölüm, r.ICD_Set_Key, icd_list_norm)
+
     if STRICT_SHORT_CIRCUIT and meta.get("SHORT_CIRCUIT", False):
         pred_final_out = float(pred_rule)
     else:
@@ -663,16 +684,20 @@ for r in tqdm(uniq_combos_df.itertuples(), total=len(uniq_combos_df), desc="PRED
         else:
             w = float(XGB_RULE_BLEND)
             pred_final_out = (1.0 - w) * float(pred_rule) + w * float(p_ens)
+
     pred_rows.append({
         "YaşGrup": r.YaşGrup, "Bölüm": r.Bölüm, "ICD_Set_Key": r.ICD_Set_Key,
         "Pred_Final": float(pred_final_out),
         "Pred_Final_Rounded": round_half_up(pred_final_out),
         "PRED_RULE": float(pred_rule),
         "PRED_XGB_PLAIN": float(p_plain) if pd.notna(p_plain) else np.nan,
-        "PRED_XGB_LOG": float(p_log) if pd.notna(p_log) else np.nan,
-        "PRED_XGB_ENS": float(p_ens) if pd.notna(p_ens) else np.nan, **meta
+        "PRED_XGB_LOG":   float(p_log)   if pd.notna(p_log)   else np.nan,
+        "PRED_XGB_ENS":   float(p_ens)   if pd.notna(p_ens)   else np.nan,
+        **meta
     })
-pd.DataFrame(pred_rows).to_excel(PRED_LOS_XLSX, index=False); print(f"OK -> {PRED_LOS_XLSX}")
+
+pd.DataFrame(pred_rows).to_excel(PRED_LOS_XLSX, index=False)
+print(f"OK -> {PRED_LOS_XLSX}")
 
 # ================== 9) YeniVakalar ==================
 if MAKE_YENI_VAKALAR:
@@ -681,17 +706,21 @@ if MAKE_YENI_VAKALAR:
     bolum_vals = df["Bölüm"].dropna().unique().tolist()
     icd_counts = Counter([icd for lst in df["ICD_List_Norm"] for icd in lst])
     top_icds = [icd for icd,_ in icd_counts.most_common(100)]
+
     def sample_icd_set():
         k = np.random.randint(1, min(5, max(2, len(top_icds))))
         return as_key(set(np.random.choice(top_icds, size=k, replace=False)))
+
     rows=[]
     for _ in tqdm(range(N_SAMPLES_YENI), desc="YeniVakalar"):
-        yg = np.random.choice(yg_vals) if yg_vals else "35-50"
+        yg  = np.random.choice(yg_vals) if yg_vals else "35-50"
         bol = np.random.choice(bolum_vals) if bolum_vals else "Dahiliye"
         key = sample_icd_set()
+
         pred_rule, meta = predict_one(yg, bol, key)
         icd_list_norm = key.split("||") if key else []
         _, _, p_ens = xgb_predict_ens(yg, bol, key, icd_list_norm)
+
         if STRICT_SHORT_CIRCUIT and meta.get("SHORT_CIRCUIT", False):
             pred_out = float(pred_rule)
         else:
@@ -700,15 +729,20 @@ if MAKE_YENI_VAKALAR:
             else:
                 w = float(XGB_RULE_BLEND)
                 pred_out = (1.0 - w) * float(pred_rule) + w * float(p_ens)
-        rows.append({"YaşGrup": yg, "Bölüm": bol, "ICD_Set_Key": key, "Pred_Final": round_half_up(pred_out), **meta})
-    pd.DataFrame(rows).to_excel(YENI_VAKALAR_XLSX, index=False); print(f"OK -> {YENI_VAKALAR_XLSX}")
+
+        rows.append({"YaşGrup": yg, "Bölüm": bol, "ICD_Set_Key": key,
+                     "Pred_Final": round_half_up(pred_out), **meta})
+
+    pd.DataFrame(rows).to_excel(YENI_VAKALAR_XLSX, index=False)
+    print(f"OK -> {YENI_VAKALAR_XLSX}")
 
 # ================== 10) VALID_PREDICTIONS ==================
 stage("VALID_PREDICTIONS.xlsx üretiliyor (valid set)")
 valid_rows=[]
 
 def _norm_col(s: str) -> str:
-    s = unicodedata.normalize("NFKD", s); s = "".join(ch for ch in s if not s or not unicodedata.combining(ch))
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not s or not unicodedata.combining(ch))
     s = s.lower(); s = re.sub(r"\s+", "_", s); s = re.sub(r"[^a-z0-9_]+", "_", s)
     return s.strip("_")
 
@@ -717,8 +751,10 @@ TRUE_LOS_COL = None
 for c in ["yatis_gun_sayisi","yatis_gun_sayisi_"]:
     if c in _norm_map: TRUE_LOS_COL = _norm_map[c]; break
 if TRUE_LOS_COL is None:
-    if "Yatış Gün Sayısı" in valid_df.columns: TRUE_LOS_COL = "Yatış Gün Sayısı"
-    elif "Yatış_Gün_Sayısı" in valid_df.columns: TRUE_LOS_COL = "Yatış_Gün_Sayısı"
+    if "Yatış Gün Sayısı" in valid_df.columns:
+        TRUE_LOS_COL = "Yatış Gün Sayısı"
+    elif "Yatış_Gün_Sayısı" in valid_df.columns:
+        TRUE_LOS_COL = "Yatış_Gün_Sayısı"
 
 n_3d_valid = 0
 for r in tqdm(valid_df.itertuples(), total=len(valid_df), desc="VALID_PREDICTIONS"):
@@ -727,8 +763,8 @@ for r in tqdm(valid_df.itertuples(), total=len(valid_df), desc="VALID_PREDICTION
 
     if TRUE_LOS_COL is not None:
         _val = valid_df.loc[r.Index, TRUE_LOS_COL]
-        try: true_los = float(_val) if pd.notna(_val) else np.nan
-        except Exception: true_los = np.nan
+        try:    true_los = float(_val) if pd.notna(_val) else np.nan
+        except: true_los = np.nan
     else:
         true_los = np.nan
 
@@ -749,12 +785,13 @@ for r in tqdm(valid_df.itertuples(), total=len(valid_df), desc="VALID_PREDICTION
 
     valid_rows.append({
         "YaşGrup": yg, "Bölüm": bol, "ICD_Set_Key": key,
-        "True_LOS": true_los, "Pred_Final": float(pred_out),
+        "True_LOS": true_los,
+        "Pred_Final": float(pred_out),
         "Pred_Final_Rounded": round_half_up(pred_out),
         "PRED_RULE": float(pred_rule),
         "PRED_XGB_PLAIN": float(p_plain) if pd.notna(p_plain) else np.nan,
-        "PRED_XGB_LOG": float(p_log) if pd.notna(p_log) else np.nan,
-        "PRED_XGB_ENS": float(p_ens) if pd.notna(p_ens) else np.nan,
+        "PRED_XGB_LOG":   float(p_log)   if pd.notna(p_log)   else np.nan,
+        "PRED_XGB_ENS":   float(p_ens)   if pd.notna(p_ens)   else np.nan,
         **meta
     })
 
@@ -769,6 +806,7 @@ if SPLIT_BY_COMBO:
     print("Split modu: KOMBINASYON (valid'de 3D bekleme).")
 else:
     print("Split modu: SATIR (valid'de 3D mümkün).")
+
 print("Train satır:", len(train_df), "Valid satır:", len(valid_df))
 print("β (tekil) öğrenilen ICD:", len(beta_icd))
 print("γ (ikili) öğrenilen pair:", len(gamma_pairs))
@@ -782,7 +820,7 @@ def _metrics(y_true, y_pred, tag):
     if m.any():
         yt = y_true[m].astype(float); yp = y_pred[m].astype(float)
         mae = mean_absolute_error(yt, yp); rmse = math.sqrt(mean_squared_error(yt, yp))
-        print(f"{tag}  MAE: {mae:.4f}  RMSE: {rmse:.4f}")
+        print(f"{tag} MAE: {mae:.4f} RMSE: {rmse:.4f}")
     else:
         print(f"{tag}: Geçerli satır yok.")
 
@@ -794,10 +832,8 @@ if "PRED_XGB_ENS" in valid_pred_df.columns:
 
 # ================== 11) APP KULLANIMI – FONKSİYONLAR ==================
 def app_normalize_inputs(yas_grup: str, bolum: str, icd_input) -> tuple:
-    yg_in = str(yas_grup or "").strip()
-    b_in  = str(bolum or "").strip()
+    yg_in = str(yas_grup or "").strip(); b_in = str(bolum or "").strip()
     yg, b = canon_demo(yg_in, b_in)
-
     parts = []
     if isinstance(icd_input, str):
         s = re.sub(r"\|\|", "|", icd_input or "")
@@ -810,7 +846,6 @@ def app_normalize_inputs(yas_grup: str, bolum: str, icd_input) -> tuple:
         parts = [clean_icd(p) for p in tmp]
     else:
         parts = []
-
     parts = sorted(set([p for p in parts if p]))
     key = clean_icd_set_key("||".join(parts))
     return yg, b, parts, key
@@ -818,8 +853,8 @@ def app_normalize_inputs(yas_grup: str, bolum: str, icd_input) -> tuple:
 def app_predict(yas_grup: str, bolum: str, icd_input):
     yg, b, parts, key = app_normalize_inputs(yas_grup, bolum, icd_input)
     pred_rule, meta = predict_one(yg, b, key)
-
     p_plain, p_log, p_ens = xgb_predict_ens(yg, b, key, parts)
+
     if STRICT_SHORT_CIRCUIT and meta.get("SHORT_CIRCUIT", False):
         pred_out = float(pred_rule)
     else:
@@ -829,14 +864,11 @@ def app_predict(yas_grup: str, bolum: str, icd_input):
             pred_out = (1.0 - float(XGB_RULE_BLEND)) * float(pred_rule) + float(XGB_RULE_BLEND) * float(p_ens)
 
     return {
-        "yas_grup": yg,
-        "bolum": b,
-        "icd_list": parts,
-        "icd_set_key": key,
+        "yas_grup": yg, "bolum": b, "icd_list": parts, "icd_set_key": key,
         "pred_rule": float(pred_rule),
         "pred_xgb_plain": float(p_plain) if pd.notna(p_plain) else None,
-        "pred_xgb_log": float(p_log) if pd.notna(p_log) else None,
-        "pred_xgb_ens": float(p_ens) if pd.notna(p_ens) else None,
+        "pred_xgb_log":   float(p_log)   if pd.notna(p_log)   else None,
+        "pred_xgb_ens":   float(p_ens)   if pd.notna(p_ens)   else None,
         "pred_final": float(pred_out),
         "pred_final_rounded": round_half_up(pred_out),
         "meta": meta
@@ -877,11 +909,10 @@ def tahmin_et(icd_list, bolum=None, yas_grup=None):
         for it in (icd_list or []):
             s = re.sub(r"\|\|", "|", str(it or ""))
             parts_raw.extend([p for p in re.split(r"[,\;\|\s]+", s) if p.strip()])
-
     parts = sorted(set([clean_icd(x) for x in parts_raw if str(x).strip()]))
     key = clean_icd_set_key("||".join(parts))
-
     yg, b = canon_demo((yas_grup or "").strip(), (bolum or "").strip())
+
     pred_rule, meta = predict_one(yg, b, key)
     p_plain, p_log, p_ens = xgb_predict_ens(yg, b, key, parts)
 
