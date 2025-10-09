@@ -76,8 +76,8 @@ XGB_PARAMS = dict(
 
 STRICT_SHORT_CIRCUIT = True
 PREFER_TRAIN_FOR_EXACT = False
-USE_FULL_FOR_EXACT = True          # ← FULL exact kısa devreyi kullan
-FULL_MIN_N = 1                     # ← N eşiği (FULL short-circuit için)
+USE_FULL_FOR_EXACT = True          # FULL exact kısa devre
+FULL_MIN_N = 1                     # FULL short-circuit N eşiği
 # ====================================================
 
 __all__ = ["tahmin_et","app_predict","app_predict_many","app_info"]
@@ -401,7 +401,7 @@ lkp1_map = {r["ICD_Set_Key"]:(r["P50"], r["N"]) for _,r in lkp1.iterrows()}
 lkp0_p50 = float(lkp0["P50"].iloc[0]) if len(lkp0)>0 else 0.0
 lkp0_p90 = float(lkp0["P90"].iloc[0]) if len(lkp0)>0 else 0.0
 
-# FULL mapler (exact short-circuit ve guardrails için; WINSORIZE edilmiş df_full'den)
+# FULL mapler (exact & guardrails; WINSORIZE edilmiş full)
 lkp3_full_map = {(r["YaşGrup"], r["Bölüm"], r["ICD_Set_Key"]):(r["P50"], r["N"]) for _,r in lkp3_full.iterrows()}
 lkp2_full_map = {(r["Bölüm"], r["ICD_Set_Key"]):(r["P50"], r["N"]) for _,r in lkp2_full.iterrows()}
 lkp1_full_map = {r["ICD_Set_Key"]:(r["P50"], r["N"]) for _,r in lkp1_full.iterrows()}
@@ -468,7 +468,7 @@ def _topk_weighted_anchor(candidates, target_set:set, K:int=TOPK_NEIGHBORS, rho:
     scored.sort(key=lambda x: (x[0], x[2], x[1]), reverse=True)
     bestJ, bestP50, _bestN, bestKey = scored[0]
 
-    # 🔒 Hiç örtüşme yoksa (J=0) “komşu” kabul etme
+    # Hiç örtüşme yoksa (J=0) komşu yok
     if bestJ <= 0.0:
         return 0.0, None, None
 
@@ -483,25 +483,24 @@ def _topk_weighted_anchor(candidates, target_set:set, K:int=TOPK_NEIGHBORS, rho:
 def nearest_neighbor_anchor(yg:str, bolum:str, target_key:str):
     target = as_set(target_key)
 
-    # 3D (J>0 gerek)
+    # 3D
     cand3 = [(key, *lkp3_map.get((yg, bolum, key), (None, 0))) for key in ctx3_by_demo.get((yg, bolum), [])]
     bestJ, w_p50, bestKey = _topk_weighted_anchor(cand3, target)
     if bestKey is not None:
         return bestJ, float(w_p50 if w_p50 is not None else lkp0_p50), bestKey, "3D_DEMO"
 
-    # 2D (J>0 gerek)
+    # 2D
     cand2 = [(key, p50, n) for (b, key), (p50, n) in lkp2_map.items() if b == bolum]
     bestJ, w_p50, bestKey = _topk_weighted_anchor(cand2, target)
     if bestKey is not None:
         return bestJ, float(w_p50 if w_p50 is not None else lkp0_p50), bestKey, "2D"
 
-    # 1D (J>0 varsa onu al)
+    # 1D
     cand1 = [(key, p50, n) for key, (p50, n) in lkp1_map.items()]
     bestJ, w_p50, bestKey = _topk_weighted_anchor(cand1, target)
     if bestKey is not None:
         return bestJ, float(w_p50 if w_p50 is not None else lkp0_p50), bestKey, "1D"
 
-    #Hiçbiri yoksa artık tahmin verme
     return 0.0, 0.0, None, "NONE"
 
 def model_contrib(target_key:str, anchor_key:str):
@@ -541,7 +540,7 @@ def guardrails(yg:str, bolum:str, target_key:str, pred:float):
     for r in lkp1.itertuples():
         if as_set(r.ICD_Set_Key).issubset(T): floor_val = max(floor_val, float(r.P50))
 
-    # FULL floors (winsorize edilmiş) — aynı mantık
+    # FULL floors (winsorize edilmiş)
     if USE_FULL_FOR_EXACT:
         for r in lkp3_full[(lkp3_full["YaşGrup"]==yg) & (lkp3_full["Bölüm"]==bolum)].itertuples():
             if as_set(r.ICD_Set_Key).issubset(T): floor_val = max(floor_val, float(r.P50))
@@ -557,7 +556,7 @@ def predict_one(yg:str, bolum:str, target_key:str):
 
     src, anchor_p50, n, anchor_key = find_anchor(yg, bolum, target_key)
 
-    # 3D/2D/1D birebir eşleşme → short-circuit
+    # Birebir eşleşme → short-circuit
     if anchor_p50 is not None and anchor_key == target_key and not str(src).startswith("NEIGHBOR"):
         meta = {"ANCHOR_SRC": src, "ANCHOR_KEY": anchor_key or "", "ANCHOR_P50": float(anchor_p50),
                 "ALPHA_JACCARD": 0.0, "ADDED_ICDS": "", "BETA_SUM": 0.0, "GAMMA_SUM": 0.0,
@@ -576,10 +575,10 @@ def predict_one(yg:str, bolum:str, target_key:str):
     model_pred = float(anchor_p50) + add_total
     pred_blend = (1.0 - alpha) * model_pred + alpha * float(anchor_p50)
 
-    # ---- PATCH #3: Guardrails uygula (TRAIN + FULL)
+    # Guardrails uygula (TRAIN + FULL)
     pred_guarded = guardrails(yg, bolum, target_key, pred_blend)
 
-    # 1 günü altı saçmalıkları engelle
+    # 1 gün altı saçmalığı engelle
     pred_final = float(anchor_p50) if pred_guarded < 1.0 else pred_guarded
 
     # Üstten cap (demo P90)
