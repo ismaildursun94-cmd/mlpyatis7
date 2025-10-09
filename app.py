@@ -13,22 +13,10 @@ from fastapi.responses import (
 )
 from pydantic import BaseModel, field_validator
 
-# proje.py'den tahmin fonksiyonları ve dosya adları
+# proje.py'den fonksiyonlar
 from proje import tahmin_et, app_predict, app_info, run_training_pipeline
 
-# Bu değişkenler proje.py'de global; import başarısızsa varsayılanlara düşeceğiz
-
-
-@app.head("/", response_class=PlainTextResponse)
-def index_head():
-    return ""  # 200 OK; Render'ın HEAD health-check'i 405 görmesin
-@app.head("/ready", response_class=PlainTextResponse)
-def ready_head():
-    return ""
-@app.head("/health", response_class=PlainTextResponse)
-def health_head():
-    return ""
-
+# Global değişkenler (fallback'li)
 try:
     from proje import (
         LOOKUP_XLSX,
@@ -44,19 +32,18 @@ except Exception:
     YENI_VAKALAR_XLSX = "YeniVakalar.xlsx"
     MODEL_DIR = "model_out"
 
+# -------------------------------
+# Uygulama ve durum bayrakları
+# -------------------------------
 app = FastAPI(title="LOS Predictor API", version="1.2.0")
 
-# ---- Isınma durumu (global bayrak) ----
 MODEL_READY: bool = False
-MODEL_MODE: str = os.environ.get("MODE", "train").lower()  # "train" | "load" (ileride load_from_artifacts eklenebilir)
+MODEL_MODE: str = os.environ.get("MODE", "train").lower()  # "train" | "load" (ileride loader eklenebilir)
 MODEL_ERROR: Optional[str] = None
 
 
 def _background_warmup():
-    """
-    Ağır işlemi (eğitim/ısıtma) ana thread'i bloklamadan çalıştır.
-    Render gibi platformlarda port taraması böylece zaman aşımına düşmez.
-    """
+    """Ağır eğitimi ana thread'i bloklamadan çalıştır."""
     global MODEL_READY, MODEL_ERROR
     try:
         if MODEL_MODE == "train":
@@ -64,40 +51,49 @@ def _background_warmup():
             run_training_pipeline()
             print("[WARMUP] Training pipeline done.")
         else:
-            # Buraya ileride load_from_artifacts(LOOKUP_XLSX, MODEL_DIR) koyabiliriz
             print("[WARMUP] Load mode selected, but loader not implemented yet; running training as fallback.")
             run_training_pipeline()
         MODEL_READY = True
         MODEL_ERROR = None
     except Exception as e:
-        MODEL_ERROR = f"{type(e).__name__}: {e}"
         MODEL_READY = False
+        MODEL_ERROR = f"{type(e).__name__}: {e}"
         print("[WARMUP][ERROR]", MODEL_ERROR)
 
 
-# Sunucu ayağa kalkarken arka planda ısınma başlat
 @app.on_event("startup")
 async def _warmup():
     threading.Thread(target=_background_warmup, daemon=True).start()
 
+# -------------------------------
+# HEAD handler'ları (Render health-check için)
+# -------------------------------
+@app.head("/", response_class=PlainTextResponse)
+def index_head():
+    return ""
+
+@app.head("/ready", response_class=PlainTextResponse)
+def ready_head():
+    return ""
+
+@app.head("/health", response_class=PlainTextResponse)
+def health_head():
+    return ""
 
 # -------------------------------
-# 1) API Modeli (JSON istekleri için)
+# 1) API Modeli
 # -------------------------------
 class PredictRequest(BaseModel):
-    # icd_list string veya liste gelebilir: "A04||K30, R51  R90.0" ya da ["A04","K30",...]
     icd_list: Union[str, List[str]]
     bolum: Optional[str] = None
     yas_grup: Optional[str] = None
 
-    # JSON parse edilmeden ÖNCE string/listeyi normalize et
     @field_validator("icd_list", mode="before")
     @classmethod
     def _coerce_icd_list(cls, v):
         def split_any(s: str):
             s = re.sub(r"\|\|", "|", s or "")
             return [p.strip() for p in re.split(r"[,\;\|\s]+", s) if p and p.strip()]
-
         if isinstance(v, str):
             return split_any(v)
         elif isinstance(v, (list, tuple, set)):
@@ -110,7 +106,6 @@ class PredictRequest(BaseModel):
             return tmp
         return []
 
-    # Boş olamaz + trimle
     @field_validator("icd_list")
     @classmethod
     def _not_empty(cls, v: List[str]):
@@ -119,9 +114,8 @@ class PredictRequest(BaseModel):
             raise ValueError("icd_list boş olamaz")
         return v
 
-
 # -------------------------------
-# 2) Ana Sayfa (yalın arayüz)
+# 2) Ana Sayfa
 # -------------------------------
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -226,7 +220,6 @@ def index():
     </html>
     """
 
-
 # -------------------------------
 # 3) Sağlık / bilgi
 # -------------------------------
@@ -238,7 +231,6 @@ def health():
 def ready():
     return {"ready": MODEL_READY, "mode": MODEL_MODE, "error": MODEL_ERROR}
 
-
 @app.get("/info", response_class=JSONResponse)
 def info():
     try:
@@ -246,18 +238,14 @@ def info():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Hata: {e}")
 
-
 # -------------------------------
-# 4) Tahmin (JSON → düz metin sayı)
+# 4) Tahmin uçları
 # -------------------------------
 @app.post("/predict", response_class=PlainTextResponse)
 def predict(req: PredictRequest):
-    """Sadece sayısal değer döndürür (Pred_Final_Rounded)."""
     if not MODEL_READY:
-        # Eğitim bitmeden tahmin isteme → 503
         msg = "Model hazır değil (ısınma sürüyor)." + (f" Hata: {MODEL_ERROR}" if MODEL_ERROR else "")
         raise HTTPException(status_code=503, detail=msg)
-
     try:
         out = tahmin_et(req.icd_list, req.bolum, req.yas_grup)
         val = out.get("Pred_Final_Rounded", None)
@@ -267,65 +255,51 @@ def predict(req: PredictRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Hata: {e}")
 
-
-# -------------------------------
-# 5) Tam JSON isteyenler için
-# -------------------------------
 @app.post("/predict_json", response_class=JSONResponse)
 def predict_json(req: PredictRequest):
-    """Tüm detayları (ANCHOR_SRC, ANCHOR_P50, model skorları, final harman) döndürür."""
     if not MODEL_READY:
         msg = "Model hazır değil (ısınma sürüyor)." + (f" Hata: {MODEL_ERROR}" if MODEL_ERROR else "")
         raise HTTPException(status_code=503, detail=msg)
-
     try:
         out = app_predict(req.yas_grup or "", req.bolum or "", req.icd_list)
         return out
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Hata: {e}")
 
-
 # -------------------------------
-# 6) Dosya indirme uçları
+# 5) Dosya indirme
 # -------------------------------
 def _file_or_404(path: str, download_name: Optional[str] = None) -> FileResponse:
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail=f"Dosya bulunamadı: {os.path.basename(path)}")
     return FileResponse(path, filename=download_name or os.path.basename(path))
 
-
 @app.get("/download/lookup")
 def download_lookup():
     return _file_or_404(LOOKUP_XLSX)
-
 
 @app.get("/download/pred_los")
 def download_pred_los():
     return _file_or_404(PRED_LOS_XLSX)
 
-
 @app.get("/download/valid")
 def download_valid():
     return _file_or_404(VALID_PRED_XLSX)
-
 
 @app.get("/download/yeni")
 def download_yeni():
     return _file_or_404(YENI_VAKALAR_XLSX)
 
-
 @app.get("/download/model/{name}")
 def download_model_file(name: str):
-    # model_out klasörü içinden güvenli isimler
     safe = re.fullmatch(r"[A-Za-z0-9_.\-]+", name)
     if not safe:
         raise HTTPException(status_code=400, detail="Geçersiz dosya adı")
     path = os.path.join(MODEL_DIR, name)
     return _file_or_404(path)
 
-
 # -------------------------------
-# 7) Form-POST (opsiyonel)
+# 6) Form-POST (opsiyonel)
 # -------------------------------
 @app.post("/tahmin", response_class=PlainTextResponse)
 def tahmin_form(
@@ -336,9 +310,7 @@ def tahmin_form(
     if not MODEL_READY:
         msg = "Model hazır değil (ısınma sürüyor)." + (f" Hata: {MODEL_ERROR}" if MODEL_ERROR else "")
         raise HTTPException(status_code=503, detail=msg)
-
     try:
-        # Formdan gelen serbest metni de aynı kuralla parçala
         s = re.sub(r"\|\|", "|", icd_text or "")
         icds = [p.strip() for p in re.split(r"[,\;\|\s]+", s) if p.strip()]
         out = tahmin_et(icds, bolum, yas_grup)
@@ -349,9 +321,8 @@ def tahmin_form(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Hata: {e}")
 
-
 # -------------------------------
-# 8) Çalıştırıcı (lokal)
+# 7) Lokal çalıştırıcı
 # -------------------------------
 if __name__ == "__main__":
     import uvicorn
