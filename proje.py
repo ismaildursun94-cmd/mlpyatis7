@@ -78,6 +78,15 @@ STRICT_SHORT_CIRCUIT   = True
 PREFER_TRAIN_FOR_EXACT = False
 USE_FULL_FOR_EXACT     = True   # FULL exact kısa devre
 FULL_MIN_N             = 1      # FULL short-circuit N eşiği
+
+UNSEEN_BETA_PRIOR_FRAC  = 0.30  # görülmemiş tekil ICD için global beta medyanının % kaçı
+UNSEEN_GAMMA_PRIOR_FRAC = 0.20  # görülmemiş pair için global gamma medyanının % kaçı
+MIN_SUPPORT_FOR_FULL_WEIGHT = 3 # zaten vardı; 3 altına shrink uyguluyoruz
+
+
+
+
+
 # ====================================================
 
 __all__ = ["tahmin_et","app_predict","app_predict_many","app_info"]
@@ -366,7 +375,9 @@ for pair, samples in pair_to_gamma_samples.items():
     if len(samples) >= MIN_SUPPORT:
         gamma_pairs[pair] = float(np.median(samples))
         gamma_support[pair] = int(len(samples))
-
+# ---- global medyan öncelleri
+BETA_MED  = float(np.median(list(beta_icd.values())))  if len(beta_icd)  else 0.0
+GAMMA_MED = float(np.median(list(gamma_pairs.values()))) if len(gamma_pairs) else 0.0
 # ================== 5) LOOKUP EXCEL ==================
 stage("Lookup Excel yazılıyor")
 _br_base = df[["ICD_Set_Key","ICD_List_Norm"]].copy()
@@ -497,27 +508,50 @@ def nearest_neighbor_anchor(yg:str, bolum:str, target_key:str):
         return bestJ, float(w_p50 if w_p50 is not None else lkp0_p50), bestKey, "1D"
     return 0.0, 0.0, None, "NONE"
 
-def model_contrib(target_key:str, anchor_key:str):
-    T = as_set(target_key); A = as_set(anchor_key) if anchor_key else set()
+def model_contrib(target_key: str, anchor_key: str):
+    T = as_set(target_key)
+    A = as_set(anchor_key) if anchor_key else set()
 
     def beta_scaled(icd):
-        val = max(0.0, beta_icd.get(icd, 0.0)); sup = beta_support.get(icd, 0)
-        return val * (1.0 if sup>=3 else SHRINK_1SUPPORT_SCALE)
+        # görülmüş değer varsa onu al; yoksa global prior ver
+        val = beta_icd.get(icd, None)
+        if val is None:
+            val = UNSEEN_BETA_PRIOR_FRAC * BETA_MED
+        sup = beta_support.get(icd, 0)
+        return float(val) * (1.0 if sup >= MIN_SUPPORT_FOR_FULL_WEIGHT else SHRINK_1SUPPORT_SCALE)
 
-    def gamma_scaled(i,j):
-        val = max(0.0, gamma_pairs.get((i,j), gamma_pairs.get((j,i), 0.0)))
-        sup = max(gamma_support.get((i,j),0), gamma_support.get((j,i),0))
-        return val * (1.0 if sup>=3 else SHRINK_1SUPPORT_SCALE)
+    def gamma_scaled(i, j):
+        # i-j çifti görülmüşse onu al; yoksa prior
+        val = gamma_pairs.get((i, j), gamma_pairs.get((j, i), None))
+        if val is None:
+            val = UNSEEN_GAMMA_PRIOR_FRAC * GAMMA_MED
+            sup = 0
+        else:
+            sup = max(gamma_support.get((i, j), 0), gamma_support.get((j, i), 0))
+        return float(val) * (1.0 if sup >= MIN_SUPPORT_FOR_FULL_WEIGHT else SHRINK_1SUPPORT_SCALE)
 
-    add_single = sorted(T - A); rem_single = sorted(A - T)
-    beta_sum  = sum(beta_scaled(i) for i in add_single) - REMOVAL_PENALTY*sum(beta_scaled(i) for i in rem_single)
+    # T − A: hedefte olup anchorda olmayanlar (eklenen ICD’ler)
+    add_single = sorted(T - A)
+    # A − T: anchorda olup hedefte olmayanlar (çıkan ICD’ler)
+    rem_single = sorted(A - T)
 
-    pairs_T = set(itertools.combinations(sorted(T),2)); pairs_A = set(itertools.combinations(sorted(A),2))
-    add_pairs = pairs_T - pairs_A; rem_pairs = pairs_A - pairs_T
-    gamma_sum = sum(gamma_scaled(i,j) for (i,j) in add_pairs) - REMOVAL_PENALTY*sum(gamma_scaled(i,j) for (i,j) in rem_pairs)
+    beta_sum = (
+        sum(beta_scaled(i) for i in add_single)
+        - REMOVAL_PENALTY * sum(beta_scaled(i) for i in rem_single)
+    )
 
+    pairs_T = set(itertools.combinations(sorted(T), 2))
+    pairs_A = set(itertools.combinations(sorted(A), 2))
+    add_pairs = pairs_T - pairs_A
+    rem_pairs = pairs_A - pairs_T
+
+    gamma_sum = (
+        sum(gamma_scaled(i, j) for (i, j) in add_pairs)
+        - REMOVAL_PENALTY * sum(gamma_scaled(i, j) for (i, j) in rem_pairs)
+    )
+
+    # ADDED_ICDS için liste döndürüyoruz
     return beta_sum, gamma_sum, add_single
-
 def saturation(total_add:float, k:float=SATURATION_K):
     return float(k * (1.0 - math.exp(-float(total_add)/float(k)))) if SATURATION_ON else float(total_add)
 
