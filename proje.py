@@ -438,17 +438,17 @@ single_floor_map = dict(zip(LKP_ICD["ICD_Kod"], LKP_ICD["P50"]))
 
 def find_anchor(yg: str, bolum: str, key: str):
     """
-    Önce exact anchor dener:
-      - Öncelik: TRAIN 1D (N≥TRAIN_MIN_N_1D) > TRAIN 2D (N≥TRAIN_MIN_N_2D) > TRAIN 3D (N≥TRAIN_MIN_N_3D)
-      - Sonra FULL exact (N≥FULL_MIN_N) : 1D_FULL > 2D_FULL > 3D_FULL
-    Bulamazsa: T'nin bilinen en büyük alt-küme anchor'ını arar (subset anchor).
+    Sıra:
+      1) EXACT (TRAIN): 3D > 2D > 1D
+      2) SUBSET (önce TRAIN, sonra FULL)
+      3) EXACT (FULL): 3D > 2D > 1D
     """
-    # ---- 0) EXACT (TRAIN) ----
-    train_1d = lkp1_map.get(key)
-    if train_1d is not None:
-        p50, n = train_1d
-        if int(n) >= int(TRAIN_MIN_N_1D):
-            return "1D_TRAIN", float(p50), int(n), key
+    # ---- 1) EXACT (TRAIN): 3D > 2D > 1D ----
+    train_3d = lkp3_map.get((yg, bolum, key))
+    if train_3d is not None:
+        p50, n = train_3d
+        if int(n) >= int(TRAIN_MIN_N_3D):
+            return "3D_TRAIN", float(p50), int(n), key
 
     train_2d = lkp2_map.get((bolum, key))
     if train_2d is not None:
@@ -456,38 +456,18 @@ def find_anchor(yg: str, bolum: str, key: str):
         if int(n) >= int(TRAIN_MIN_N_2D):
             return "2D_TRAIN", float(p50), int(n), key
 
-    train_3d = lkp3_map.get((yg, bolum, key))
-    if train_3d is not None:
-        p50, n = train_3d
-        if int(n) >= int(TRAIN_MIN_N_3D):
-            return "3D_TRAIN", float(p50), int(n), key
-
-    # ---- 1) EXACT (FULL) ----
-    if USE_FULL_FOR_EXACT:
-        full_1d = lkp1_full_map.get(key)
-        if full_1d is not None:
-            p50, n = full_1d
-            if int(n) >= int(FULL_MIN_N):
-                return "1D_FULL", float(p50), int(n), key
-
-        full_2d = lkp2_full_map.get((bolum, key))
-        if full_2d is not None:
-            p50, n = full_2d
-            if int(n) >= int(FULL_MIN_N):
-                return "2D_FULL", float(p50), int(n), key
-
-        full_3d = lkp3_full_map.get((yg, bolum, key))
-        if full_3d is not None:
-            p50, n = full_3d
-            if int(n) >= int(FULL_MIN_N):
-                return "3D_FULL", float(p50), int(n), key
+    train_1d = lkp1_map.get(key)
+    if train_1d is not None:
+        p50, n = train_1d
+        if int(n) >= int(TRAIN_MIN_N_1D):
+            return "1D_TRAIN", float(p50), int(n), key
 
     # ---- 2) SUBSET-ANCHOR (TRAIN -> FULL) ----
     T = as_set(key)
     if T:
-        # en büyük alt-kümeyi bul: önce TRAIN 3D subsetleri, sonra 2D, sonra 1D
         best = None  # (rank, p50, n, key, src)
-        # TRAIN 3D
+
+        # TRAIN 3D subset
         for (yg_, bol_, k_), (p50, n) in lkp3_map.items():
             S = as_set(k_)
             if yg_ == yg and bol_ == bolum and S and S.issubset(T) and S != T and int(n) >= TRAIN_MIN_N_3D:
@@ -495,7 +475,8 @@ def find_anchor(yg: str, bolum: str, key: str):
                 if (best is None) or (len(as_set(cand[3])) > len(as_set(best[3])) or
                                       (len(as_set(cand[3])) == len(as_set(best[3])) and cand[1] > best[1])):
                     best = cand
-        # TRAIN 2D
+
+        # TRAIN 2D subset
         for (bol_, k_), (p50, n) in lkp2_map.items():
             S = as_set(k_)
             if bol_ == bolum and S and S.issubset(T) and S != T and int(n) >= TRAIN_MIN_N_2D:
@@ -503,7 +484,8 @@ def find_anchor(yg: str, bolum: str, key: str):
                 if (best is None) or (len(as_set(cand[3])) > len(as_set(best[3])) or
                                       (len(as_set(cand[3])) == len(as_set(best[3])) and cand[1] > best[1])):
                     best = cand
-        # TRAIN 1D
+
+        # TRAIN 1D subset
         for k_, (p50, n) in lkp1_map.items():
             S = as_set(k_)
             if S and S.issubset(T) and S != T and int(n) >= TRAIN_MIN_N_1D:
@@ -512,9 +494,9 @@ def find_anchor(yg: str, bolum: str, key: str):
                                       (len(as_set(cand[3])) == len(as_set(best[3])) and cand[1] > best[1])):
                     best = cand
 
-        # FULL subset fallback (aynı mantık)
+        # FULL subset fallback
         if best is None and USE_FULL_FOR_EXACT:
-            # FULL 3D
+            # FULL 3D subset
             for (yg_, bol_, k_), (p50, n) in lkp3_full_map.items():
                 S = as_set(k_)
                 if yg_ == yg and bol_ == bolum and S and S.issubset(T) and S != T and int(n) >= FULL_MIN_N:
@@ -522,7 +504,7 @@ def find_anchor(yg: str, bolum: str, key: str):
                     if (best is None) or (len(as_set(cand[3])) > len(as_set(best[3])) or
                                           (len(as_set(cand[3])) == len(as_set(best[3])) and cand[1] > best[1])):
                         best = cand
-            # FULL 2D
+            # FULL 2D subset
             for (bol_, k_), (p50, n) in lkp2_full_map.items():
                 S = as_set(k_)
                 if bol_ == bolum and S and S.issubset(T) and S != T and int(n) >= FULL_MIN_N:
@@ -530,7 +512,7 @@ def find_anchor(yg: str, bolum: str, key: str):
                     if (best is None) or (len(as_set(cand[3])) > len(as_set(best[3])) or
                                           (len(as_set(cand[3])) == len(as_set(best[3])) and cand[1] > best[1])):
                         best = cand
-            # FULL 1D
+            # FULL 1D subset
             for k_, (p50, n) in lkp1_full_map.items():
                 S = as_set(k_)
                 if S and S.issubset(T) and S != T and int(n) >= FULL_MIN_N:
@@ -543,7 +525,26 @@ def find_anchor(yg: str, bolum: str, key: str):
             _rank, p50, n, k_best, src = best
             return src, float(p50), int(n), k_best
 
-    # ---- 3) Hiçbiri yoksa: None ----
+    # ---- 3) EXACT (FULL): 3D > 2D > 1D ----
+    if USE_FULL_FOR_EXACT:
+        full_3d = lkp3_full_map.get((yg, bolum, key))
+        if full_3d is not None:
+            p50, n = full_3d
+            if int(n) >= int(FULL_MIN_N):
+                return "3D_FULL", float(p50), int(n), key
+
+        full_2d = lkp2_full_map.get((bolum, key))
+        if full_2d is not None:
+            p50, n = full_2d
+            if int(n) >= int(FULL_MIN_N):
+                return "2D_FULL", float(p50), int(n), key
+
+        full_1d = lkp1_full_map.get(key)
+        if full_1d is not None:
+            p50, n = full_1d
+            if int(n) >= int(FULL_MIN_N):
+                return "1D_FULL", float(p50), int(n), key
+
     return (None, None, 0, None)
 
 def _topk_weighted_anchor(candidates, target_set:set, K:int=TOPK_NEIGHBORS, rho:float=RHO_J):
@@ -697,7 +698,9 @@ def predict_one(yg:str, bolum:str, target_key:str):
     # 1 gün altı koruma
     pred_final = float(anchor_p50) if pred_guarded < 1.0 else pred_guarded
 
-    # ÜSTTEN CAP YOK (kaldırıldı)
+    # CAP flag (guardrail fark etti mi?)
+    cap_applied = (abs(pred_guarded - pred_blend) > 1e-9)
+
 
     meta = {
         "ANCHOR_SRC": src,
@@ -711,7 +714,7 @@ def predict_one(yg:str, bolum:str, target_key:str):
         "PRED_BLEND": float(pred_blend),
         "PRED_AFTER_GUARDRAILS": float(pred_guarded),
         "SHORT_CIRCUIT": False,
-        "CAP_APPLIED": False,
+        "CAP_APPLIED": bool(cap_applied), 
         "IS_SUPERSET_OF_ANCHOR": bool(is_superset)
     }
     return float(pred_final), meta
