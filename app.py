@@ -17,6 +17,12 @@ from pydantic import BaseModel, field_validator
 from proje import tahmin_et, app_predict, app_info, run_training_pipeline
 
 # Bu değişkenler proje.py'de global; import başarısızsa varsayılanlara düşeceğiz
+
+
+@app.head("/", response_class=PlainTextResponse)
+def index_head():
+    return ""  # 200 OK; Render'ın HEAD health-check'i 405 görmesin
+
 try:
     from proje import (
         LOOKUP_XLSX,
