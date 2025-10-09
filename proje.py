@@ -195,755 +195,779 @@ def as_key(s:set)->str: return "||".join(sorted(s))
 
 def as_csr(x): return x if sparse.issparse(x) else sparse.csr_matrix(x)
 
-# ================== 1) YÜKLE & TEMİZLE ==================
-stage("Excel okunuyor")
-if not os.path.exists(EXCEL_PATH):
-    raise FileNotFoundError(f"Bulunamadı: {EXCEL_PATH}")
-
-df_raw = pd.read_excel(EXCEL_PATH)
-df = df_raw.copy()
-
-# Yaş & LOS
-if "Yaş" in df.columns:
-    df["Yaş"] = df["Yaş"].apply(yas_to_years)
-else:
-    df["Yaş"] = pd.NA
-
-df["Yatış Gün Sayısı"] = pd.to_numeric(df["Yatış Gün Sayısı"], errors="coerce")
-df = df[df["Yatış Gün Sayısı"] > 0].copy()
-
-# ICD listeleri (gerekirse metinden fallback)
-if "ICD Kodu" not in df.columns:
-    df["ICD Kodu"] = ""
-
-if REQUIRE_ICD and df["ICD Kodu"].fillna("").eq("").any() and FALLBACK_FROM_TEXT:
-    base_text_col = "ICD Adi Ve Kodu" if "ICD Adi Ve Kodu" in df.columns else None
-    if base_text_col:
-        ix = df["ICD Kodu"].fillna("").eq("")
-        df.loc[ix, "ICD Kodu"] = df.loc[ix, base_text_col].fillna("").apply(
-            lambda t: ",".join(extract_icd_from_text(t))
-        )
-
-df["ICD_List"] = df["ICD Kodu"].apply(split_icd_cell)
-df["ICD_List_Norm"], df["ICD_Set_Key"] = zip(*df["ICD_List"].apply(normalize_icd_set))
-df["ICD_Set_Key"] = df["ICD_Set_Key"].apply(clean_icd_set_key)
-df["ICD_Sayısı"] = df["ICD_List_Norm"].apply(len)
-df = df[~(REQUIRE_ICD & (df["ICD_Sayısı"]==0))].copy()
-
-# Embedding metni
-base_text_col = "ICD Adi Ve Kodu" if "ICD Adi Ve Kodu" in df.columns else "ICD Kodu"
-df["ICD_Text_Embed"] = df[base_text_col].map(clean_text_anywhere_tags).fillna("")
-
-# YaşGrup
-df["Yaş_Yıl_Int"] = pd.to_numeric(df["Yaş"], errors="coerce").round().astype("Int64")
-df["YaşGrup"] = df["Yaş"].apply(yas_to_group)
-
-# --- Demo kanonik sözlükleri ---
-YG_UNIQ = { _norm_text_basic(v): v for v in df["YaşGrup"].dropna().astype(str).unique() }
-BOLUM_UNIQ = { _norm_text_basic(v): v for v in df["Bölüm"].dropna().astype(str).unique() }
-
-def canon_demo(yas_grup: str, bolum: str) -> tuple[str,str]:
-    yg = YG_UNIQ.get(_norm_text_basic(yas_grup), str(yas_grup or "").strip())
-    b  = BOLUM_UNIQ.get(_norm_text_basic(bolum), str(bolum or "").strip())
-    return yg, b
-
-# ================== 2) TRAIN/VALID SPLIT ==================
-stage("Train/Valid ayrımı")
-df["ComboID"] = df["YaşGrup"].astype(str)+"||"+df["Bölüm"].astype(str)+"||"+df["ICD_Set_Key"].astype(str)
-
-if SPLIT_BY_COMBO:
-    stage("Kombinasyon-bazlı split (valid'de 3D bekleme)")
-    unique_combos = df["ComboID"].dropna().unique()
-    train_combos, valid_combos = train_test_split(unique_combos, test_size=0.2, random_state=RANDOM_SEED)
-    is_train = df["ComboID"].isin(train_combos)
-    train_df = df[is_train].copy()
-    valid_df = df[~is_train].copy()
-else:
-    stage("Satır-bazlı split (valid'de 3D mümkün)")
-    idx_train, idx_valid = train_test_split(df.index, test_size=0.2, random_state=RANDOM_SEED)
-    train_df = df.loc[idx_train].copy()
-    valid_df = df.loc[idx_valid].copy()
-    _overlap_rate = (valid_df["ComboID"].isin(train_df["ComboID"].unique())).mean()
-    print(f"Valid satırlarının train ile ComboID örtüşme oranı: {_overlap_rate:.2%}")
-
-# ---- Winsorize (sadece train)
-def _winsorize_series(s: pd.Series, lo: float, hi: float) -> pd.Series:
-    q_lo = s.quantile(lo); q_hi = s.quantile(hi)
-    return s.clip(lower=q_lo, upper=q_hi)
-
-if WINSORIZE_ON:
-    stage(f"Winsorize (train) - p{int(WINSOR_LO*100)} / p{int(WINSOR_HI*100)}")
-    train_df["Yatış Gün Sayısı"] = _winsorize_series(train_df["Yatış Gün Sayısı"], WINSOR_LO, WINSOR_HI)
-
-# ---- (YENİ) FULL için winsorize edilmiş kopya
-df_full = df.copy()
-if WINSORIZE_ON:
-    stage(f"Winsorize (FULL) - p{int(WINSOR_LO*100)} / p{int(WINSOR_HI*100)}")
-    df_full["Yatış Gün Sayısı"] = _winsorize_series(df_full["Yatış Gün Sayısı"], WINSOR_LO, WINSOR_HI)
-
-# ================== 3) LOOKUP TABLOLARI ==================
-stage("Lookup tabloları (train + full)")
-
-# ---- TRAIN lookuplar (P90 sütunları RAPOR için kalır)
-lkp3 = (train_df.groupby(["YaşGrup","Bölüm","ICD_Set_Key"], as_index=False)
-        .agg(N=("Yatış Gün Sayısı","count"),
-             Ortalama=("Yatış Gün Sayısı", lambda x: round_half_up(x.mean())),
-             P50=("Yatış Gün Sayısı","median"),
-             P90=("Yatış Gün Sayısı", p90)))
-lkp3["ICD_Set_Key"] = lkp3["ICD_Set_Key"].apply(clean_icd_set_key)
-
-lkp2 = (train_df.groupby(["Bölüm","ICD_Set_Key"], as_index=False)
-        .agg(N=("Yatış Gün Sayısı","count"),
-             Ortalama=("Yatış Gün Sayısı", lambda x: round_half_up(x.mean())),
-             P50=("Yatış Gün Sayısı","median"),
-             P90=("Yatış Gün Sayısı", p90)))
-lkp2["ICD_Set_Key"] = lkp2["ICD_Set_Key"].apply(clean_icd_set_key)
-
-lkp1 = (train_df.groupby(["ICD_Set_Key"], as_index=False)
-        .agg(N=("Yatış Gün Sayısı","count"),
-             Ortalama=("Yatış Gün Sayısı", lambda x: round_half_up(x.mean())),
-             P50=("Yatış Gün Sayısı","median"),
-             P90=("Yatış Gün Sayısı", p90)))
-lkp1["ICD_Set_Key"] = lkp1["ICD_Set_Key"].apply(clean_icd_set_key)
-
-lkp0 = pd.DataFrame({
-    "N": [train_df.shape[0]],
-    "Ortalama": [round_half_up(train_df["Yatış Gün Sayısı"].mean())],
-    "P50": [train_df["Yatış Gün Sayısı"].median()],
-    "P90": [train_df["Yatış Gün Sayısı"].quantile(0.9)]
-})
-
-# ---- FULL lookuplar (WINSORIZE EDİLMİŞ FULL ÜZERİNDEN)
-lkp3_full = (df_full.groupby(["YaşGrup","Bölüm","ICD_Set_Key"], as_index=False)
-             .agg(N=("Yatış Gün Sayısı","count"), P50=("Yatış Gün Sayısı","median")))
-lkp3_full["ICD_Set_Key"] = lkp3_full["ICD_Set_Key"].apply(clean_icd_set_key)
-
-lkp2_full = (df_full.groupby(["Bölüm","ICD_Set_Key"], as_index=False)
-             .agg(N=("Yatış Gün Sayısı","count"), P50=("Yatış Gün Sayısı","median")))
-lkp2_full["ICD_Set_Key"] = lkp2_full["ICD_Set_Key"].apply(clean_icd_set_key)
-
-lkp1_full = (df_full.groupby(["ICD_Set_Key"], as_index=False)
-             .agg(N=("Yatış Gün Sayısı","count"), P50=("Yatış Gün Sayısı","median")))
-lkp1_full["ICD_Set_Key"] = lkp1_full["ICD_Set_Key"].apply(clean_icd_set_key)
-
-# Tekil / pair yardımcı tablolar (train)
-single = train_df[train_df["ICD_Sayısı"]==1].copy()
-single["ICD_Kod"] = single["ICD_List_Norm"].str[0]
-LKP_ICD = single.groupby("ICD_Kod")["Yatış Gün Sayısı"].agg(N="count", P50="median").reset_index()
-
-pairs = train_df[train_df["ICD_Sayısı"]==2].copy()
-pairs["PairKey"] = pairs["ICD_List_Norm"].apply(lambda lst: "||".join(sorted(lst)))
-LKP_PAIR = pairs.groupby(["YaşGrup","Bölüm","PairKey"])["Yatış Gün Sayısı"].agg(N="count", P50="median").reset_index()
-
-DEMO_P90_MAP = (train_df.groupby(["YaşGrup","Bölüm"])["Yatış Gün Sayısı"]
-                .quantile(0.9).reset_index().rename(columns={"Yatış Gün Sayısı":"P90"}))
-demop90_map = {(r["YaşGrup"], r["Bölüm"]): float(r["P90"]) for _, r in DEMO_P90_MAP.iterrows()}
-
-# ================== 4) β / γ ÖĞREN ==================
-stage("β/γ öğreniliyor")
-icd_to_beta_samples = defaultdict(list)
-
-ctx3 = lkp3.copy(); ctx3["Set"] = ctx3["ICD_Set_Key"].apply(as_set)
-one_map    = dict(zip(lkp1["ICD_Set_Key"], lkp1["P50"]))
-single_map = dict(zip(LKP_ICD["ICD_Kod"],   LKP_ICD["P50"]))
-
-for _, row in ctx3.iterrows():
-    key, p50 = row["ICD_Set_Key"], row["P50"]
-    S = as_set(key)
-    if len(S) < 2: continue
-    for icd in S:
-        base_candidates = []
-        if icd in single_map: base_candidates.append(single_map[icd])
-        if icd in one_map:    base_candidates.append(one_map.get(icd, 0.0))
-        base = max(base_candidates) if base_candidates else 0.0
-        delta = max(0.0, float(p50) - float(base))
-        icd_to_beta_samples[icd].append(delta)
-
-beta_icd, beta_support = {}, {}
-for icd, samples in icd_to_beta_samples.items():
-    if len(samples) >= MIN_SUPPORT:
-        beta_icd[icd] = float(np.median(samples))
-        beta_support[icd] = int(len(samples))
-
-pair_to_gamma_samples = defaultdict(list)
-for _, row in LKP_PAIR.iterrows():
-    i, j = row["PairKey"].split("||"); p50 = row["P50"]
-    base = max(single_map.get(i, 0.0), single_map.get(j, 0.0))
-    delta = max(0.0, float(p50) - float(base))
-    pair_to_gamma_samples[(i,j)].append(delta)
-    pair_to_gamma_samples[(j,i)].append(delta)
-
-gamma_pairs, gamma_support = {}, {}
-for pair, samples in pair_to_gamma_samples.items():
-    if len(samples) >= MIN_SUPPORT:
-        gamma_pairs[pair] = float(np.median(samples))
-        gamma_support[pair] = int(len(samples))
-# ---- global medyan öncelleri
-BETA_MED  = float(np.median(list(beta_icd.values())))  if len(beta_icd)  else 0.0
-GAMMA_MED = float(np.median(list(gamma_pairs.values()))) if len(gamma_pairs) else 0.0
-# ================== 5) LOOKUP EXCEL ==================
-stage("Lookup Excel yazılıyor")
-_br_base = df[["ICD_Set_Key","ICD_List_Norm"]].copy()
-BR_ICDSET_MAP = (_br_base.explode("ICD_List_Norm")
-                 .rename(columns={"ICD_List_Norm":"ICD"})
-                 ).dropna(subset=["ICD"]).drop_duplicates().reset_index(drop=True)
-
-DIM_ICD = pd.DataFrame({"ICD": sorted({icd for lst in df["ICD_List_Norm"] for icd in lst})})
-_age_order = ["0-1","2-5","5-10","10-15","15-25","25-35","35-50","50-65","65+"]
-_present = [yg for yg in _age_order if yg in set(df["YaşGrup"].dropna().astype(str).unique())]
-DIM_YASGRUP = pd.DataFrame({"YaşGrup": _present})
-
-with pd.ExcelWriter(LOOKUP_XLSX, engine="xlsxwriter") as w:
-    lkp3.to_excel(w, index=False, sheet_name="LKP_3D_YasGrup_TRAIN")
-    lkp2.to_excel(w, index=False, sheet_name="LKP_2D_TRAIN")
-    lkp1.to_excel(w, index=False, sheet_name="LKP_1D_TRAIN")
-    lkp0.to_excel(w, index=False, sheet_name="LKP_0D_TRAIN")
-
-    lkp3_full.to_excel(w, index=False, sheet_name="LKP_3D_FULL")
-    lkp2_full.to_excel(w, index=False, sheet_name="LKP_2D_FULL")
-    lkp1_full.to_excel(w, index=False, sheet_name="LKP_1D_FULL")
-
-    LKP_ICD.to_excel(w, index=False, sheet_name="LKP_ICD_TRAIN")
-    df[["ICD_Text_Embed"]].to_excel(w, index=False, sheet_name="TEXT_EMB_SOURCE")
-    BR_ICDSET_MAP.to_excel(w, index=False, sheet_name="BR_ICDSET_MAP")
-    DIM_ICD.to_excel(w, index=False, sheet_name="DIM_ICD")
-    DIM_YASGRUP.to_excel(w, index=False, sheet_name="DIM_YASGRUP")
-print(f"OK -> {LOOKUP_XLSX}")
-
-# ================== 6) ANCHOR / PREDICT ==================
-stage("Prediction yardımcı yapılar")
-
-# TRAIN mapler
-lkp3_map = {(r["YaşGrup"], r["Bölüm"], r["ICD_Set_Key"]):(r["P50"], r["N"]) for _,r in lkp3.iterrows()}
-lkp2_map = {(r["Bölüm"], r["ICD_Set_Key"]):(r["P50"], r["N"]) for _,r in lkp2.iterrows()}
-lkp1_map = {r["ICD_Set_Key"]:(r["P50"], r["N"]) for _,r in lkp1.iterrows()}
-
-lkp0_p50 = float(lkp0["P50"].iloc[0]) if len(lkp0)>0 else 0.0
-lkp0_p90 = float(lkp0["P90"].iloc[0]) if len(lkp0)>0 else 0.0  # raporda var
-
-# FULL mapler (exact & guardrails; WINSORIZE edilmiş full)
-lkp3_full_map = {(r["YaşGrup"], r["Bölüm"], r["ICD_Set_Key"]):(r["P50"], r["N"]) for _,r in lkp3_full.iterrows()}
-lkp2_full_map = {(r["Bölüm"], r["ICD_Set_Key"]):(r["P50"], r["N"]) for _,r in lkp2_full.iterrows()}
-lkp1_full_map = {r["ICD_Set_Key"]:(r["P50"], r["N"]) for _,r in lkp1_full.iterrows()}
-
-ctx3_by_demo = defaultdict(list)
-for _, r in lkp3.iterrows():
-    ctx3_by_demo[(r["YaşGrup"], r["Bölüm"])].append(r["ICD_Set_Key"])
-
-pair_floor_map = {}
-for _, r in LKP_PAIR.iterrows():
-    pair_floor_map[r["PairKey"]] = max(pair_floor_map.get(r["PairKey"], 0.0), float(r["P50"]))
-single_floor_map = dict(zip(LKP_ICD["ICD_Kod"], LKP_ICD["P50"]))
-
-
-def find_anchor(yg: str, bolum: str, key: str):
-    """
-    Sıra:
-      1) EXACT (TRAIN): 3D > 2D > 1D
-      2) SUBSET (önce TRAIN, sonra FULL)
-      3) EXACT (FULL): 3D > 2D > 1D
-    """
-    # ---- 1) EXACT (TRAIN): 3D > 2D > 1D ----
-    train_3d = lkp3_map.get((yg, bolum, key))
-    if train_3d is not None:
-        p50, n = train_3d
-        if int(n) >= int(TRAIN_MIN_N_3D):
-            return "3D_TRAIN", float(p50), int(n), key
-
-    train_2d = lkp2_map.get((bolum, key))
-    if train_2d is not None:
-        p50, n = train_2d
-        if int(n) >= int(TRAIN_MIN_N_2D):
-            return "2D_TRAIN", float(p50), int(n), key
-
-    train_1d = lkp1_map.get(key)
-    if train_1d is not None:
-        p50, n = train_1d
-        if int(n) >= int(TRAIN_MIN_N_1D):
-            return "1D_TRAIN", float(p50), int(n), key
-
-    # ---- 2) SUBSET-ANCHOR (TRAIN -> FULL) ----
-    T = as_set(key)
-    if T:
-        best = None  # (rank, p50, n, key, src)
-
-        # TRAIN 3D subset
-        for (yg_, bol_, k_), (p50, n) in lkp3_map.items():
-            S = as_set(k_)
-            if yg_ == yg and bol_ == bolum and S and S.issubset(T) and S != T and int(n) >= TRAIN_MIN_N_3D:
-                cand = (3, float(p50), int(n), k_, "3D_TRAIN_SUBSET")
-                if (best is None) or (len(as_set(cand[3])) > len(as_set(best[3])) or
-                                      (len(as_set(cand[3])) == len(as_set(best[3])) and cand[1] > best[1])):
-                    best = cand
-
-        # TRAIN 2D subset
-        for (bol_, k_), (p50, n) in lkp2_map.items():
-            S = as_set(k_)
-            if bol_ == bolum and S and S.issubset(T) and S != T and int(n) >= TRAIN_MIN_N_2D:
-                cand = (2, float(p50), int(n), k_, "2D_TRAIN_SUBSET")
-                if (best is None) or (len(as_set(cand[3])) > len(as_set(best[3])) or
-                                      (len(as_set(cand[3])) == len(as_set(best[3])) and cand[1] > best[1])):
-                    best = cand
-
-        # TRAIN 1D subset
-        for k_, (p50, n) in lkp1_map.items():
-            S = as_set(k_)
-            if S and S.issubset(T) and S != T and int(n) >= TRAIN_MIN_N_1D:
-                cand = (1, float(p50), int(n), k_, "1D_TRAIN_SUBSET")
-                if (best is None) or (len(as_set(cand[3])) > len(as_set(best[3])) or
-                                      (len(as_set(cand[3])) == len(as_set(best[3])) and cand[1] > best[1])):
-                    best = cand
-
-        # FULL subset fallback
-        if best is None and USE_FULL_FOR_EXACT:
-            # FULL 3D subset
-            for (yg_, bol_, k_), (p50, n) in lkp3_full_map.items():
-                S = as_set(k_)
-                if yg_ == yg and bol_ == bolum and S and S.issubset(T) and S != T and int(n) >= FULL_MIN_N:
-                    cand = (3, float(p50), int(n), k_, "3D_FULL_SUBSET")
-                    if (best is None) or (len(as_set(cand[3])) > len(as_set(best[3])) or
-                                          (len(as_set(cand[3])) == len(as_set(best[3])) and cand[1] > best[1])):
-                        best = cand
-            # FULL 2D subset
-            for (bol_, k_), (p50, n) in lkp2_full_map.items():
-                S = as_set(k_)
-                if bol_ == bolum and S and S.issubset(T) and S != T and int(n) >= FULL_MIN_N:
-                    cand = (2, float(p50), int(n), k_, "2D_FULL_SUBSET")
-                    if (best is None) or (len(as_set(cand[3])) > len(as_set(best[3])) or
-                                          (len(as_set(cand[3])) == len(as_set(best[3])) and cand[1] > best[1])):
-                        best = cand
-            # FULL 1D subset
-            for k_, (p50, n) in lkp1_full_map.items():
-                S = as_set(k_)
-                if S and S.issubset(T) and S != T and int(n) >= FULL_MIN_N:
-                    cand = (1, float(p50), int(n), k_, "1D_FULL_SUBSET")
-                    if (best is None) or (len(as_set(cand[3])) > len(as_set(best[3])) or
-                                          (len(as_set(cand[3])) == len(as_set(best[3])) and cand[1] > best[1])):
-                        best = cand
-
-        if best is not None:
-            _rank, p50, n, k_best, src = best
-            return src, float(p50), int(n), k_best
-
-    # ---- 3) EXACT (FULL): 3D > 2D > 1D ----
-    if USE_FULL_FOR_EXACT:
-        full_3d = lkp3_full_map.get((yg, bolum, key))
-        if full_3d is not None:
-            p50, n = full_3d
-            if int(n) >= int(FULL_MIN_N):
-                return "3D_FULL", float(p50), int(n), key
-
-        full_2d = lkp2_full_map.get((bolum, key))
-        if full_2d is not None:
-            p50, n = full_2d
-            if int(n) >= int(FULL_MIN_N):
-                return "2D_FULL", float(p50), int(n), key
-
-        full_1d = lkp1_full_map.get(key)
-        if full_1d is not None:
-            p50, n = full_1d
-            if int(n) >= int(FULL_MIN_N):
-                return "1D_FULL", float(p50), int(n), key
-
-    return (None, None, 0, None)
-
-def _topk_weighted_anchor(candidates, target_set:set, K:int=TOPK_NEIGHBORS, rho:float=RHO_J):
-    scored = []
-    for key, p50, n in candidates:
-        J = jaccard(target_set, as_set(key))
-        if p50 is None: continue
-        scored.append((J, float(p50), int(n if n is not None else 0), key))
-    if not scored: return 0.0, None, None
-    scored.sort(key=lambda x: (x[0], x[2], x[1]), reverse=True)
-    bestJ, bestP50, _bestN, bestKey = scored[0]
-    if bestJ <= 0.0:  # hiç örtüşme yoksa komşu yok
-        return 0.0, None, None
-    topk = [r for r in scored if r[0] > 0.0][:K]
-    Wvals = [(((J**float(rho)) * math.log1p(max(0, n))), p50) for J, p50, n, _k in topk]
-    W = sum(w for w, _ in Wvals)
-    if W <= 0: return bestJ, bestP50, bestKey
-    wmean = sum(p * w for w, p in Wvals) / W
-    return bestJ, float(wmean), bestKey
-
-def nearest_neighbor_anchor(yg:str, bolum:str, target_key:str):
-    target = as_set(target_key)
-    # 3D
-    cand3 = [(key, *lkp3_map.get((yg, bolum, key), (None, 0))) for key in ctx3_by_demo.get((yg, bolum), [])]
-    bestJ, w_p50, bestKey = _topk_weighted_anchor(cand3, target)
-    if bestKey is not None:
-        return bestJ, float(w_p50 if w_p50 is not None else lkp0_p50), bestKey, "3D_DEMO"
-    # 2D
-    cand2 = [(key, p50, n) for (b, key), (p50, n) in lkp2_map.items() if b == bolum]
-    bestJ, w_p50, bestKey = _topk_weighted_anchor(cand2, target)
-    if bestKey is not None:
-        return bestJ, float(w_p50 if w_p50 is not None else lkp0_p50), bestKey, "2D"
-    # 1D
-    cand1 = [(key, p50, n) for key, (p50, n) in lkp1_map.items()]
-    bestJ, w_p50, bestKey = _topk_weighted_anchor(cand1, target)
-    if bestKey is not None:
-        return bestJ, float(w_p50 if w_p50 is not None else lkp0_p50), bestKey, "1D"
-    return 0.0, 0.0, None, "NONE"
-
-def model_contrib(target_key: str, anchor_key: str):
-    T = as_set(target_key)
-    A = as_set(anchor_key) if anchor_key else set()
-
-    def beta_scaled(icd):
-        # görülmüş değer varsa onu al; yoksa global prior ver
-        val = beta_icd.get(icd, None)
-        if val is None:
-            val = UNSEEN_BETA_PRIOR_FRAC * BETA_MED
-        sup = beta_support.get(icd, 0)
-        return float(val) * (1.0 if sup >= MIN_SUPPORT_FOR_FULL_WEIGHT else SHRINK_1SUPPORT_SCALE)
-
-    def gamma_scaled(i, j):
-        # i-j çifti görülmüşse onu al; yoksa prior
-        val = gamma_pairs.get((i, j), gamma_pairs.get((j, i), None))
-        if val is None:
-            val = UNSEEN_GAMMA_PRIOR_FRAC * GAMMA_MED
-            sup = 0
-        else:
-            sup = max(gamma_support.get((i, j), 0), gamma_support.get((j, i), 0))
-        return float(val) * (1.0 if sup >= MIN_SUPPORT_FOR_FULL_WEIGHT else SHRINK_1SUPPORT_SCALE)
-
-    # T − A: hedefte olup anchorda olmayanlar (eklenen ICD’ler)
-    add_single = sorted(T - A)
-    # A − T: anchorda olup hedefte olmayanlar (çıkan ICD’ler)
-    rem_single = sorted(A - T)
-
-    beta_sum = (
-        sum(beta_scaled(i) for i in add_single)
-        - REMOVAL_PENALTY * sum(beta_scaled(i) for i in rem_single)
-    )
-
-    pairs_T = set(itertools.combinations(sorted(T), 2))
-    pairs_A = set(itertools.combinations(sorted(A), 2))
-    add_pairs = pairs_T - pairs_A
-    rem_pairs = pairs_A - pairs_T
-
-    gamma_sum = (
-        sum(gamma_scaled(i, j) for (i, j) in add_pairs)
-        - REMOVAL_PENALTY * sum(gamma_scaled(i, j) for (i, j) in rem_pairs)
-    )
-
-    # ADDED_ICDS için liste döndürüyoruz
-    return beta_sum, gamma_sum, add_single
-def saturation(total_add:float, k:float=SATURATION_K):
-    return float(k * (1.0 - math.exp(-float(total_add)/float(k)))) if SATURATION_ON else float(total_add)
-
-# --------- GUARDRAILS (TRAIN + FULL) ---------
-def guardrails(yg:str, bolum:str, target_key:str, pred:float):
-    T = as_set(target_key)
-    floor_val = float(pred)
-
-    # Pair floor (TRAIN)
-    for i,j in itertools.combinations(sorted(T),2):
-        pf = max(pair_floor_map.get(f"{i}||{j}",0.0), pair_floor_map.get(f"{j}||{i}",0.0))
-        floor_val = max(floor_val, pf)
-
-    # TRAIN floors (subset kapsama)
-    for r in lkp3[(lkp3["YaşGrup"]==yg) & (lkp3["Bölüm"]==bolum)].itertuples():
-        if as_set(r.ICD_Set_Key).issubset(T): floor_val = max(floor_val, float(r.P50))
-    for r in lkp2[lkp2["Bölüm"]==bolum].itertuples():
-        if as_set(r.ICD_Set_Key).issubset(T): floor_val = max(floor_val, float(r.P50))
-    for r in lkp1.itertuples():
-        if as_set(r.ICD_Set_Key).issubset(T): floor_val = max(floor_val, float(r.P50))
-
-    # FULL floors (winsorize edilmiş)
-    if USE_FULL_FOR_EXACT:
-        for r in lkp3_full[(lkp3_full["YaşGrup"]==yg) & (lkp3_full["Bölüm"]==bolum)].itertuples():
-            if as_set(r.ICD_Set_Key).issubset(T): floor_val = max(floor_val, float(r.P50))
-        for r in lkp2_full[lkp2_full["Bölüm"]==bolum].itertuples():
-            if as_set(r.ICD_Set_Key).issubset(T): floor_val = max(floor_val, float(r.P50))
-        for r in lkp1_full.itertuples():
-            if as_set(r.ICD_Set_Key).issubset(T): floor_val = max(floor_val, float(r.P50))
-
-    return float(floor_val)
-
-def predict_one(yg:str, bolum:str, target_key:str):
-    yg, bolum = canon_demo(yg, bolum)
-    src, anchor_p50, n, anchor_key = find_anchor(yg, bolum, target_key)
-
-    # Birebir eşleşme → short-circuit
-    if anchor_p50 is not None and anchor_key == target_key and not str(src).startswith("NEIGHBOR"):
-        meta = {
-            "ANCHOR_SRC": src, "ANCHOR_KEY": anchor_key or "", "ANCHOR_P50": float(anchor_p50),
-            "ALPHA_JACCARD": 0.0, "ADDED_ICDS": "", "BETA_SUM": 0.0, "GAMMA_SUM": 0.0,
-            "MODEL_PRED": float(anchor_p50), "PRED_BLEND": float(anchor_p50),
-            "PRED_AFTER_GUARDRAILS": float(anchor_p50),
-            "SHORT_CIRCUIT": True, "CAP_APPLIED": False,
-            "IS_SUPERSET_OF_ANCHOR": False
-        }
-        return float(anchor_p50), meta
-
-    # Anchor yoksa komşu (yakın anchor seç, α=Jaccard ile harmanla)
-    if anchor_p50 is None:
-        J, neigh_p50, neigh_key, neigh_src = nearest_neighbor_anchor(yg, bolum, target_key)
-        anchor_p50, anchor_key, src, alpha = float(neigh_p50), neigh_key, f"NEIGHBOR_{neigh_src}", float(J)
+# ================== 1..METRİKLER: EĞİTİM BLOĞU ==================
+def run_training_pipeline():
+    global df, df_full, df_raw, train_df, valid_df
+    global lkp0, lkp1, lkp2, lkp3, lkp1_full, lkp2_full, lkp3_full
+    global LKP_ICD, LKP_PAIR, DEMO_P90_MAP, demop90_map
+    global beta_icd, beta_support, gamma_pairs, gamma_support, BETA_MED, GAMMA_MED
+    global BR_ICDSET_MAP, DIM_ICD, DIM_YASGRUP
+    global lkp3_map, lkp2_map, lkp1_map, lkp0_p50, lkp0_p90
+    global lkp3_full_map, lkp2_full_map, lkp1_full_map, ctx3_by_demo
+    global pair_floor_map, single_floor_map
+    global xgb_plain, xgb_log, ohe, mlb
+    global xgb_predict_ens  # fonksiyonu globalde bağlayacağız
+
+    # ================== 1) YÜKLE & TEMİZLE ==================
+    stage("Excel okunuyor")
+    if not os.path.exists(EXCEL_PATH):
+        raise FileNotFoundError(f"Bulunamadı: {EXCEL_PATH}")
+
+    df_raw = pd.read_excel(EXCEL_PATH)
+    df = df_raw.copy()
+
+    # Yaş & LOS
+    if "Yaş" in df.columns:
+        df["Yaş"] = df["Yaş"].apply(yas_to_years)
     else:
-        alpha = 0.0
+        df["Yaş"] = pd.NA
 
-    # Superset mi? (T ⊃ A) -> bağıl katkılar devreye girecek
-    Tset, Aset = as_set(target_key), (as_set(anchor_key) if anchor_key else set())
-    is_superset = (len(Aset) > 0 and Aset.issubset(Tset) and Tset != Aset)
+    df["Yatış Gün Sayısı"] = pd.to_numeric(df["Yatış Gün Sayısı"], errors="coerce")
+    df = df[df["Yatış Gün Sayısı"] > 0].copy()
 
-    beta_sum, gamma_sum, added_icds = model_contrib(target_key, anchor_key)
-    add_total = saturation(beta_sum + gamma_sum)
-    model_pred = float(anchor_p50) + add_total
-    pred_blend = (1.0 - alpha) * model_pred + alpha * float(anchor_p50)
+    # ICD listeleri (gerekirse metinden fallback)
+    if "ICD Kodu" not in df.columns:
+        df["ICD Kodu"] = ""
 
-    # Guardrails (alt tabanlar)
-    pred_guarded = guardrails(yg, bolum, target_key, pred_blend)
+    if REQUIRE_ICD and df["ICD Kodu"].fillna("").eq("").any() and FALLBACK_FROM_TEXT:
+        base_text_col = "ICD Adi Ve Kodu" if "ICD Adi Ve Kodu" in df.columns else None
+        if base_text_col:
+            ix = df["ICD Kodu"].fillna("").eq("")
+            df.loc[ix, "ICD Kodu"] = df.loc[ix, base_text_col].fillna("").apply(
+                lambda t: ",".join(extract_icd_from_text(t))
+            )
 
-    # 1 gün altı koruma
-    pred_final = float(anchor_p50) if pred_guarded < 1.0 else pred_guarded
+    df["ICD_List"] = df["ICD Kodu"].apply(split_icd_cell)
+    df["ICD_List_Norm"], df["ICD_Set_Key"] = zip(*df["ICD_List"].apply(normalize_icd_set))
+    df["ICD_Set_Key"] = df["ICD_Set_Key"].apply(clean_icd_set_key)
+    df["ICD_Sayısı"] = df["ICD_List_Norm"].apply(len)
+    df = df[~(REQUIRE_ICD & (df["ICD_Sayısı"]==0))].copy()
 
-    # CAP flag (guardrail fark etti mi?)
-    cap_applied = (abs(pred_guarded - pred_blend) > 1e-9)
+    # Embedding metni
+    base_text_col = "ICD Adi Ve Kodu" if "ICD Adi Ve Kodu" in df.columns else "ICD Kodu"
+    df["ICD_Text_Embed"] = df[base_text_col].map(clean_text_anywhere_tags).fillna("")
 
+    # YaşGrup
+    df["Yaş_Yıl_Int"] = pd.to_numeric(df["Yaş"], errors="coerce").round().astype("Int64")
+    df["YaşGrup"] = df["Yaş"].apply(yas_to_group)
 
-    meta = {
-        "ANCHOR_SRC": src,
-        "ANCHOR_KEY": anchor_key or "",
-        "ANCHOR_P50": float(anchor_p50),
-        "ALPHA_JACCARD": float(alpha),
-        "ADDED_ICDS": ",".join(added_icds),  # T − A
-        "BETA_SUM": float(beta_sum),
-        "GAMMA_SUM": float(gamma_sum),
-        "MODEL_PRED": float(model_pred),
-        "PRED_BLEND": float(pred_blend),
-        "PRED_AFTER_GUARDRAILS": float(pred_guarded),
-        "SHORT_CIRCUIT": False,
-        "CAP_APPLIED": bool(cap_applied), 
-        "IS_SUPERSET_OF_ANCHOR": bool(is_superset)
-    }
-    return float(pred_final), meta
+    # --- Demo kanonik sözlükleri ---
+    YG_UNIQ = { _norm_text_basic(v): v for v in df["YaşGrup"].dropna().astype(str).unique() }
+    BOLUM_UNIQ = { _norm_text_basic(v): v for v in df["Bölüm"].dropna().astype(str).unique() }
 
-# ================== 7) MODEL ARTEFAKTLARI ==================
-stage("Model dosyaları yazılıyor")
-os.makedirs(MODEL_DIR, exist_ok=True)
-with open(os.path.join(MODEL_DIR, "beta_icd.json"), "w", encoding="utf-8") as f:
-    json.dump(beta_icd, f, ensure_ascii=False, indent=2)
-with open(os.path.join(MODEL_DIR, "gamma_pairs.json"), "w", encoding="utf-8") as f:
-    json.dump({f"{i}||{j}":v for (i,j), v in gamma_pairs.items()}, f, ensure_ascii=False, indent=2)
-with open(os.path.join(MODEL_DIR, "config.json"), "w", encoding="utf-8") as f:
-    json.dump({"created_at": datetime.datetime.now().isoformat(),
-               "min_support": MIN_SUPPORT,
-               "saturation_on": SATURATION_ON,
-               "saturation_k": SATURATION_K,
-               "notes": "Cinsiyetsiz β/γ; α=Jaccard; guardrails aktif; CAP devre dışı"},
-              f, ensure_ascii=False, indent=2)
+    def canon_demo(yas_grup: str, bolum: str) -> tuple[str,str]:
+        yg = YG_UNIQ.get(_norm_text_basic(yas_grup), str(yas_grup or "").strip())
+        b  = BOLUM_UNIQ.get(_norm_text_basic(bolum), str(bolum or "").strip())
+        return yg, b
 
-# ================== 7.5) XGB ENSEMBLE ==================
-if XGB_ENS_ON:
-    stage("XGB (plain+log) eğitiliyor")
-    icd_counts = Counter([icd for lst in train_df["ICD_List_Norm"] for icd in lst])
-    XGB_TOP_ICDS = [icd for icd,_ in icd_counts.most_common(TOPK_ICD)]
+    globals()["canon_demo"] = canon_demo  # diğer fonksiyonlar kullanıyor
 
-    try:
-        ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=True)
-    except TypeError:
-        ohe = OneHotEncoder(handle_unknown="ignore", sparse=True)
-    ohe.fit(train_df[["Bölüm","YaşGrup"]])
+    # ================== 2) TRAIN/VALID SPLIT ==================
+    stage("Train/Valid ayrımı")
+    df["ComboID"] = df["YaşGrup"].astype(str)+"||"+df["Bölüm"].astype(str)+"||"+df["ICD_Set_Key"].astype(str)
 
-    mlb = MultiLabelBinarizer(classes=XGB_TOP_ICDS, sparse_output=True); mlb.fit([XGB_TOP_ICDS])
-
-    def _pack_features(df_part: pd.DataFrame):
-        X_cat = ohe.transform(df_part[["Bölüm","YaşGrup"]])
-        icd_lists = df_part["ICD_List_Norm"].apply(lambda lst: [c for c in lst if c in XGB_TOP_ICDS])
-        X_icd = mlb.transform(icd_lists)
-        x_icd_count = np.asarray(df_part["ICD_Sayısı"]).reshape(-1,1)
-        return hstack([X_cat, X_icd, x_icd_count], format="csr")
-
-    X_train = _pack_features(train_df)
-    y_train = train_df["Yatış Gün Sayısı"].astype(float).values
-    y_log   = np.log1p(y_train)
-
-    xgb_plain = XGBRegressor(**XGB_PARAMS); xgb_log = XGBRegressor(**XGB_PARAMS)
-    xgb_plain.fit(X_train, y_train); xgb_log.fit(X_train, y_log)
-
-    joblib.dump(xgb_plain, os.path.join(MODEL_DIR,"xgb_plain.joblib"))
-    joblib.dump(xgb_log,   os.path.join(MODEL_DIR,"xgb_log.joblib"))
-    joblib.dump(ohe,       os.path.join(MODEL_DIR,"xgb_ohe.joblib"))
-    joblib.dump(mlb,       os.path.join(MODEL_DIR,"xgb_mlb.joblib"))
-    joblib.dump(XGB_TOP_ICDS, os.path.join(MODEL_DIR,"xgb_top_icds.joblib"))
-
-    def xgb_predict_ens(yg, bolum, key, icd_list_norm=None):
-        if icd_list_norm is None:
-            icd_list_norm = key.split("||") if key else []
-        df_one = pd.DataFrame({"Bölüm":[bolum],"YaşGrup":[yg],
-                               "ICD_List_Norm":[icd_list_norm],"ICD_Sayısı":[len(icd_list_norm)]})
-        X_one = _pack_features(df_one)
-        p_plain = float(xgb_plain.predict(X_one)[0]); p_log = float(np.expm1(xgb_log.predict(X_one)[0]))
-        p_ens = (1.0 - float(XGB_ALPHA_LOG)) * p_plain + float(XGB_ALPHA_LOG) * p_log
-        return p_plain, p_log, p_ens
-else:
-    def xgb_predict_ens(yg, bolum, key, icd_list_norm=None):
-        return np.nan, np.nan, np.nan
-
-# ================== 8) PRED_LOS ==================
-stage("PRED_LOS.xlsx üretiliyor")
-uniq_combos_df = df[["YaşGrup","Bölüm","ICD_Set_Key"]].drop_duplicates().reset_index(drop=True)
-
-pred_rows=[]
-for r in tqdm(uniq_combos_df.itertuples(), total=len(uniq_combos_df), desc="PRED_LOS"):
-    pred_rule, meta = predict_one(r.YaşGrup, r.Bölüm, r.ICD_Set_Key)
-    icd_list_norm = r.ICD_Set_Key.split("||") if isinstance(r.ICD_Set_Key, str) and r.ICD_Set_Key else []
-    p_plain, p_log, p_ens = xgb_predict_ens(r.YaşGrup, r.Bölüm, r.ICD_Set_Key, icd_list_norm)
-
-    if STRICT_SHORT_CIRCUIT and meta.get("SHORT_CIRCUIT", False):
-        pred_final_out = float(pred_rule)
+    if SPLIT_BY_COMBO:
+        stage("Kombinasyon-bazlı split (valid'de 3D bekleme)")
+        unique_combos = df["ComboID"].dropna().unique()
+        train_combos, valid_combos = train_test_split(unique_combos, test_size=0.2, random_state=RANDOM_SEED)
+        is_train = df["ComboID"].isin(train_combos)
+        train_df = df[is_train].copy()
+        valid_df = df[~is_train].copy()
     else:
-        if XGB_RULE_BLEND is None or (not np.isfinite(p_ens)):
-            pred_final_out = float(pred_rule)
-        else:
-            w = float(XGB_RULE_BLEND)
-            pred_final_out = (1.0 - w) * float(pred_rule) + w * float(p_ens)
+        stage("Satır-bazlı split (valid'de 3D mümkün)")
+        idx_train, idx_valid = train_test_split(df.index, test_size=0.2, random_state=RANDOM_SEED)
+        train_df = df.loc[idx_train].copy()
+        valid_df = df.loc[idx_valid].copy()
+        _overlap_rate = (valid_df["ComboID"].isin(train_df["ComboID"].unique())).mean()
+        print(f"Valid satırlarının train ile ComboID örtüşme oranı: {_overlap_rate:.2%}")
 
-    pred_rows.append({
-        "YaşGrup": r.YaşGrup, "Bölüm": r.Bölüm, "ICD_Set_Key": r.ICD_Set_Key,
-        "Pred_Final": float(pred_final_out),
-        "Pred_Final_Rounded": round_half_up(pred_final_out),
-        "PRED_RULE": float(pred_rule),
-        "PRED_XGB_PLAIN": float(p_plain) if pd.notna(p_plain) else np.nan,
-        "PRED_XGB_LOG":   float(p_log)   if pd.notna(p_log)   else np.nan,
-        "PRED_XGB_ENS":   float(p_ens)   if pd.notna(p_ens)   else np.nan,
-        **meta
+    # ---- Winsorize (sadece train)
+    def _winsorize_series(s: pd.Series, lo: float, hi: float) -> pd.Series:
+        q_lo = s.quantile(lo); q_hi = s.quantile(hi)
+        return s.clip(lower=q_lo, upper=q_hi)
+
+    if WINSORIZE_ON:
+        stage(f"Winsorize (train) - p{int(WINSOR_LO*100)} / p{int(WINSOR_HI*100)}")
+        train_df["Yatış Gün Sayısı"] = _winsorize_series(train_df["Yatış Gün Sayısı"], WINSOR_LO, WINSOR_HI)
+
+    # ---- (YENİ) FULL için winsorize edilmiş kopya
+    df_full = df.copy()
+    if WINSORIZE_ON:
+        stage(f"Winsorize (FULL) - p{int(WINSOR_LO*100)} / p{int(WINSOR_HI*100)}")
+        df_full["Yatış Gün Sayısı"] = _winsorize_series(df_full["Yatış Gün Sayısı"], WINSOR_LO, WINSOR_HI)
+
+    # ================== 3) LOOKUP TABLOLARI ==================
+    stage("Lookup tabloları (train + full)")
+
+    # ---- TRAIN lookuplar (P90 sütunları RAPOR için kalır)
+    lkp3 = (train_df.groupby(["YaşGrup","Bölüm","ICD_Set_Key"], as_index=False)
+            .agg(N=("Yatış Gün Sayısı","count"),
+                 Ortalama=("Yatış Gün Sayısı", lambda x: round_half_up(x.mean())),
+                 P50=("Yatış Gün Sayısı","median"),
+                 P90=("Yatış Gün Sayısı", p90)))
+    lkp3["ICD_Set_Key"] = lkp3["ICD_Set_Key"].apply(clean_icd_set_key)
+
+    lkp2 = (train_df.groupby(["Bölüm","ICD_Set_Key"], as_index=False)
+            .agg(N=("Yatış Gün Sayısı","count"),
+                 Ortalama=("Yatış Gün Sayısı", lambda x: round_half_up(x.mean())),
+                 P50=("Yatış Gün Sayısı","median"),
+                 P90=("Yatış Gün Sayısı", p90)))
+    lkp2["ICD_Set_Key"] = lkp2["ICD_Set_Key"].apply(clean_icd_set_key)
+
+    lkp1 = (train_df.groupby(["ICD_Set_Key"], as_index=False)
+            .agg(N=("Yatış Gün Sayısı","count"),
+                 Ortalama=("Yatış Gün Sayısı", lambda x: round_half_up(x.mean())),
+                 P50=("Yatış Gün Sayısı","median"),
+                 P90=("Yatış Gün Sayısı", p90)))
+    lkp1["ICD_Set_Key"] = lkp1["ICD_Set_Key"].apply(clean_icd_set_key)
+
+    lkp0 = pd.DataFrame({
+        "N": [train_df.shape[0]],
+        "Ortalama": [round_half_up(train_df["Yatış Gün Sayısı"].mean())],
+        "P50": [train_df["Yatış Gün Sayısı"].median()],
+        "P90": [train_df["Yatış Gün Sayısı"].quantile(0.9)]
     })
 
-pd.DataFrame(pred_rows).to_excel(PRED_LOS_XLSX, index=False)
-print(f"OK -> {PRED_LOS_XLSX}")
+    # ---- FULL lookuplar (WINSORIZE EDİLMİŞ FULL ÜZERİNDEN)
+    lkp3_full = (df_full.groupby(["YaşGrup","Bölüm","ICD_Set_Key"], as_index=False)
+                 .agg(N=("Yatış Gün Sayısı","count"), P50=("Yatış Gün Sayısı","median")))
+    lkp3_full["ICD_Set_Key"] = lkp3_full["ICD_Set_Key"].apply(clean_icd_set_key)
 
-# ================== 9) YeniVakalar ==================
-if MAKE_YENI_VAKALAR:
-    stage("YeniVakalar.xlsx üretiliyor")
-    yg_vals = df["YaşGrup"].dropna().unique().tolist()
-    bolum_vals = df["Bölüm"].dropna().unique().tolist()
-    icd_counts = Counter([icd for lst in df["ICD_List_Norm"] for icd in lst])
-    top_icds = [icd for icd,_ in icd_counts.most_common(100)]
+    lkp2_full = (df_full.groupby(["Bölüm","ICD_Set_Key"], as_index=False)
+                 .agg(N=("Yatış Gün Sayısı","count"), P50=("Yatış Gün Sayısı","median")))
+    lkp2_full["ICD_Set_Key"] = lkp2_full["ICD_Set_Key"].apply(clean_icd_set_key)
 
-    def sample_icd_set():
-        k = np.random.randint(1, min(5, max(2, len(top_icds))))
-        return as_key(set(np.random.choice(top_icds, size=k, replace=False)))
+    lkp1_full = (df_full.groupby(["ICD_Set_Key"], as_index=False)
+                 .agg(N=("Yatış Gün Sayısı","count"), P50=("Yatış Gün Sayısı","median")))
+    lkp1_full["ICD_Set_Key"] = lkp1_full["ICD_Set_Key"].apply(clean_icd_set_key)
 
-    rows=[]
-    for _ in tqdm(range(N_SAMPLES_YENI), desc="YeniVakalar"):
-        yg  = np.random.choice(yg_vals) if yg_vals else "35-50"
-        bol = np.random.choice(bolum_vals) if bolum_vals else "Dahiliye"
-        key = sample_icd_set()
+    # Tekil / pair yardımcı tablolar (train)
+    single = train_df[train_df["ICD_Sayısı"]==1].copy()
+    single["ICD_Kod"] = single["ICD_List_Norm"].str[0]
+    LKP_ICD = single.groupby("ICD_Kod")["Yatış Gün Sayısı"].agg(N="count", P50="median").reset_index()
+
+    pairs = train_df[train_df["ICD_Sayısı"]==2].copy()
+    pairs["PairKey"] = pairs["ICD_List_Norm"].apply(lambda lst: "||".join(sorted(lst)))
+    LKP_PAIR = pairs.groupby(["YaşGrup","Bölüm","PairKey"])["Yatış Gün Sayısı"].agg(N="count", P50="median").reset_index()
+
+    DEMO_P90_MAP = (train_df.groupby(["YaşGrup","Bölüm"])["Yatış Gün Sayısı"]
+                    .quantile(0.9).reset_index().rename(columns={"Yatış Gün Sayısı":"P90"}))
+    demop90_map = {(r["YaşGrup"], r["Bölüm"]): float(r["P90"]) for _, r in DEMO_P90_MAP.iterrows()}
+
+    # ================== 4) β / γ ÖĞREN ==================
+    stage("β/γ öğreniliyor")
+    icd_to_beta_samples = defaultdict(list)
+
+    ctx3 = lkp3.copy(); ctx3["Set"] = ctx3["ICD_Set_Key"].apply(as_set)
+    one_map    = dict(zip(lkp1["ICD_Set_Key"], lkp1["P50"]))
+    single_map = dict(zip(LKP_ICD["ICD_Kod"],   LKP_ICD["P50"]))
+
+    for _, row in ctx3.iterrows():
+        key, p50 = row["ICD_Set_Key"], row["P50"]
+        S = as_set(key)
+        if len(S) < 2: continue
+        for icd in S:
+            base_candidates = []
+            if icd in single_map: base_candidates.append(single_map[icd])
+            if icd in one_map:    base_candidates.append(one_map.get(icd, 0.0))
+            base = max(base_candidates) if base_candidates else 0.0
+            delta = max(0.0, float(p50) - float(base))
+            icd_to_beta_samples[icd].append(delta)
+
+    beta_icd, beta_support = {}, {}
+    for icd, samples in icd_to_beta_samples.items():
+        if len(samples) >= MIN_SUPPORT:
+            beta_icd[icd] = float(np.median(samples))
+            beta_support[icd] = int(len(samples))
+
+    pair_to_gamma_samples = defaultdict(list)
+    for _, row in LKP_PAIR.iterrows():
+        i, j = row["PairKey"].split("||"); p50 = row["P50"]
+        base = max(single_map.get(i, 0.0), single_map.get(j, 0.0))
+        delta = max(0.0, float(p50) - float(base))
+        pair_to_gamma_samples[(i,j)].append(delta)
+        pair_to_gamma_samples[(j,i)].append(delta)
+
+    gamma_pairs, gamma_support = {}, {}
+    for pair, samples in pair_to_gamma_samples.items():
+        if len(samples) >= MIN_SUPPORT:
+            gamma_pairs[pair] = float(np.median(samples))
+            gamma_support[pair] = int(len(samples))
+    # ---- global medyan öncelleri
+    BETA_MED  = float(np.median(list(beta_icd.values())))  if len(beta_icd)  else 0.0
+    GAMMA_MED = float(np.median(list(gamma_pairs.values()))) if len(gamma_pairs) else 0.0
+
+    # ================== 5) LOOKUP EXCEL ==================
+    stage("Lookup Excel yazılıyor")
+    _br_base = df[["ICD_Set_Key","ICD_List_Norm"]].copy()
+    BR_ICDSET_MAP = (_br_base.explode("ICD_List_Norm")
+                     .rename(columns={"ICD_List_Norm":"ICD"})
+                     ).dropna(subset=["ICD"]).drop_duplicates().reset_index(drop=True)
+
+    DIM_ICD = pd.DataFrame({"ICD": sorted({icd for lst in df["ICD_List_Norm"] for icd in lst})})
+    _age_order = ["0-1","2-5","5-10","10-15","15-25","25-35","35-50","50-65","65+"]
+    _present = [yg for yg in _age_order if yg in set(df["YaşGrup"].dropna().astype(str).unique())]
+    DIM_YASGRUP = pd.DataFrame({"YaşGrup": _present})
+
+    with pd.ExcelWriter(LOOKUP_XLSX, engine="xlsxwriter") as w:
+        lkp3.to_excel(w, index=False, sheet_name="LKP_3D_YasGrup_TRAIN")
+        lkp2.to_excel(w, index=False, sheet_name="LKP_2D_TRAIN")
+        lkp1.to_excel(w, index=False, sheet_name="LKP_1D_TRAIN")
+        lkp0.to_excel(w, index=False, sheet_name="LKP_0D_TRAIN")
+
+        lkp3_full.to_excel(w, index=False, sheet_name="LKP_3D_FULL")
+        lkp2_full.to_excel(w, index=False, sheet_name="LKP_2D_FULL")
+        lkp1_full.to_excel(w, index=False, sheet_name="LKP_1D_FULL")
+
+        LKP_ICD.to_excel(w, index=False, sheet_name="LKP_ICD_TRAIN")
+        df[["ICD_Text_Embed"]].to_excel(w, index=False, sheet_name="TEXT_EMB_SOURCE")
+        BR_ICDSET_MAP.to_excel(w, index=False, sheet_name="BR_ICDSET_MAP")
+        DIM_ICD.to_excel(w, index=False, sheet_name="DIM_ICD")
+        DIM_YASGRUP.to_excel(w, index=False, sheet_name="DIM_YASGRUP")
+    print(f"OK -> {LOOKUP_XLSX}")
+
+    # ================== 6) ANCHOR / PREDICT ==================
+    stage("Prediction yardımcı yapılar")
+
+    # TRAIN mapler
+    lkp3_map = {(r["YaşGrup"], r["Bölüm"], r["ICD_Set_Key"]):(r["P50"], r["N"]) for _,r in lkp3.iterrows()}
+    lkp2_map = {(r["Bölüm"], r["ICD_Set_Key"]):(r["P50"], r["N"]) for _,r in lkp2.iterrows()}
+    lkp1_map = {r["ICD_Set_Key"]:(r["P50"], r["N"]) for _,r in lkp1.iterrows()}
+
+    lkp0_p50 = float(lkp0["P50"].iloc[0]) if len(lkp0)>0 else 0.0
+    lkp0_p90 = float(lkp0["P90"].iloc[0]) if len(lkp0)>0 else 0.0  # raporda var
+
+    # FULL mapler (exact & guardrails; WINSORIZE edilmiş full)
+    lkp3_full_map = {(r["YaşGrup"], r["Bölüm"], r["ICD_Set_Key"]):(r["P50"], r["N"]) for _,r in lkp3_full.iterrows()}
+    lkp2_full_map = {(r["Bölüm"], r["ICD_Set_Key"]):(r["P50"], r["N"]) for _,r in lkp2_full.iterrows()}
+    lkp1_full_map = {r["ICD_Set_Key"]:(r["P50"], r["N"]) for _,r in lkp1_full.iterrows()}
+
+    ctx3_by_demo = defaultdict(list)
+    for _, r in lkp3.iterrows():
+        ctx3_by_demo[(r["YaşGrup"], r["Bölüm"])].append(r["ICD_Set_Key"])
+
+    pair_floor_map = {}
+    for _, r in LKP_PAIR.iterrows():
+        pair_floor_map[r["PairKey"]] = max(pair_floor_map.get(r["PairKey"], 0.0), float(r["P50"]))
+    single_floor_map = dict(zip(LKP_ICD["ICD_Kod"], LKP_ICD["P50"]))
+
+    def find_anchor(yg: str, bolum: str, key: str):
+        """
+        Sıra:
+          1) EXACT (TRAIN): 3D > 2D > 1D
+          2) SUBSET (önce TRAIN, sonra FULL)
+          3) EXACT (FULL): 3D > 2D > 1D
+        """
+        # ---- 1) EXACT (TRAIN): 3D > 2D > 1D ----
+        train_3d = lkp3_map.get((yg, bolum, key))
+        if train_3d is not None:
+            p50, n = train_3d
+            if int(n) >= int(TRAIN_MIN_N_3D):
+                return "3D_TRAIN", float(p50), int(n), key
+
+        train_2d = lkp2_map.get((bolum, key))
+        if train_2d is not None:
+            p50, n = train_2d
+            if int(n) >= int(TRAIN_MIN_N_2D):
+                return "2D_TRAIN", float(p50), int(n), key
+
+        train_1d = lkp1_map.get(key)
+        if train_1d is not None:
+            p50, n = train_1d
+            if int(n) >= int(TRAIN_MIN_N_1D):
+                return "1D_TRAIN", float(p50), int(n), key
+
+        # ---- 2) SUBSET-ANCHOR (TRAIN -> FULL) ----
+        T = as_set(key)
+        if T:
+            best = None  # (rank, p50, n, key, src)
+
+            # TRAIN 3D subset
+            for (yg_, bol_, k_), (p50, n) in lkp3_map.items():
+                S = as_set(k_)
+                if yg_ == yg and bol_ == bolum and S and S.issubset(T) and S != T and int(n) >= TRAIN_MIN_N_3D:
+                    cand = (3, float(p50), int(n), k_, "3D_TRAIN_SUBSET")
+                    if (best is None) or (len(as_set(cand[3])) > len(as_set(best[3])) or
+                                          (len(as_set(cand[3])) == len(as_set(best[3])) and cand[1] > best[1])):
+                        best = cand
+
+            # TRAIN 2D subset
+            for (bol_, k_), (p50, n) in lkp2_map.items():
+                S = as_set(k_)
+                if bol_ == bolum and S and S.issubset(T) and S != T and int(n) >= TRAIN_MIN_N_2D:
+                    cand = (2, float(p50), int(n), k_, "2D_TRAIN_SUBSET")
+                    if (best is None) or (len(as_set(cand[3])) > len(as_set(best[3])) or
+                                          (len(as_set(cand[3])) == len(as_set(best[3])) and cand[1] > best[1])):
+                        best = cand
+
+            # TRAIN 1D subset
+            for k_, (p50, n) in lkp1_map.items():
+                S = as_set(k_)
+                if S and S.issubset(T) and S != T and int(n) >= TRAIN_MIN_N_1D:
+                    cand = (1, float(p50), int(n), k_, "1D_TRAIN_SUBSET")
+                    if (best is None) or (len(as_set(cand[3])) > len(as_set(best[3])) or
+                                          (len(as_set(cand[3])) == len(as_set(best[3])) and cand[1] > best[1])):
+                        best = cand
+
+            # FULL subset fallback
+            if best is None and USE_FULL_FOR_EXACT:
+                # FULL 3D subset
+                for (yg_, bol_, k_), (p50, n) in lkp3_full_map.items():
+                    S = as_set(k_)
+                    if yg_ == yg and bol_ == bolum and S and S.issubset(T) and S != T and int(n) >= FULL_MIN_N:
+                        cand = (3, float(p50), int(n), k_, "3D_FULL_SUBSET")
+                        if (best is None) or (len(as_set(cand[3])) > len(as_set(best[3])) or
+                                              (len(as_set(cand[3])) == len(as_set(best[3])) and cand[1] > best[1])):
+                            best = cand
+                # FULL 2D subset
+                for (bol_, k_), (p50, n) in lkp2_full_map.items():
+                    S = as_set(k_)
+                    if bol_ == bolum and S and S.issubset(T) and S != T and int(n) >= FULL_MIN_N:
+                        cand = (2, float(p50), int(n), k_, "2D_FULL_SUBSET")
+                        if (best is None) or (len(as_set(cand[3])) > len(as_set(best[3])) or
+                                              (len(as_set(cand[3])) == len(as_set(best[3])) and cand[1] > best[1])):
+                            best = cand
+                # FULL 1D subset
+                for k_, (p50, n) in lkp1_full_map.items():
+                    S = as_set(k_)
+                    if S and S.issubset(T) and S != T and int(n) >= FULL_MIN_N:
+                        cand = (1, float(p50), int(n), k_, "1D_FULL_SUBSET")
+                        if (best is None) or (len(as_set(cand[3])) > len(as_set(best[3])) or
+                                              (len(as_set(cand[3])) == len(as_set(best[3])) and cand[1] > best[1])):
+                            best = cand
+
+            if best is not None:
+                _rank, p50, n, k_best, src = best
+                return src, float(p50), int(n), k_best
+
+        # ---- 3) EXACT (FULL): 3D > 2D > 1D ----
+        if USE_FULL_FOR_EXACT:
+            full_3d = lkp3_full_map.get((yg, bolum, key))
+            if full_3d is not None:
+                p50, n = full_3d
+                if int(n) >= int(FULL_MIN_N):
+                    return "3D_FULL", float(p50), int(n), key
+
+            full_2d = lkp2_full_map.get((bolum, key))
+            if full_2d is not None:
+                p50, n = full_2d
+                if int(n) >= int(FULL_MIN_N):
+                    return "2D_FULL", float(p50), int(n), key
+
+            full_1d = lkp1_full_map.get(key)
+            if full_1d is not None:
+                p50, n = full_1d
+                if int(n) >= int(FULL_MIN_N):
+                    return "1D_FULL", float(p50), int(n), key
+
+        return (None, None, 0, None)
+
+    def _topk_weighted_anchor(candidates, target_set:set, K:int=TOPK_NEIGHBORS, rho:float=RHO_J):
+        scored = []
+        for key, p50, n in candidates:
+            J = jaccard(target_set, as_set(key))
+            if p50 is None: continue
+            scored.append((J, float(p50), int(n if n is not None else 0), key))
+        if not scored: return 0.0, None, None
+        scored.sort(key=lambda x: (x[0], x[2], x[1]), reverse=True)
+        bestJ, bestP50, _bestN, bestKey = scored[0]
+        if bestJ <= 0.0:  # hiç örtüşme yoksa komşu yok
+            return 0.0, None, None
+        topk = [r for r in scored if r[0] > 0.0][:K]
+        Wvals = [(((J**float(rho)) * math.log1p(max(0, n))), p50) for J, p50, n, _k in topk]
+        W = sum(w for w, _ in Wvals)
+        if W <= 0: return bestJ, bestP50, bestKey
+        wmean = sum(p * w for w, p in Wvals) / W
+        return bestJ, float(wmean), bestKey
+
+    def nearest_neighbor_anchor(yg:str, bolum:str, target_key:str):
+        target = as_set(target_key)
+        # 3D
+        cand3 = [(key, *lkp3_map.get((yg, bolum, key), (None, 0))) for key in ctx3_by_demo.get((yg, bolum), [])]
+        bestJ, w_p50, bestKey = _topk_weighted_anchor(cand3, target)
+        if bestKey is not None:
+            return bestJ, float(w_p50 if w_p50 is not None else lkp0_p50), bestKey, "3D_DEMO"
+        # 2D
+        cand2 = [(key, p50, n) for (b, key), (p50, n) in lkp2_map.items() if b == bolum]
+        bestJ, w_p50, bestKey = _topk_weighted_anchor(cand2, target)
+        if bestKey is not None:
+            return bestJ, float(w_p50 if w_p50 is not None else lkp0_p50), bestKey, "2D"
+        # 1D
+        cand1 = [(key, p50, n) for key, (p50, n) in lkp1_map.items()]
+        bestJ, w_p50, bestKey = _topk_weighted_anchor(cand1, target)
+        if bestKey is not None:
+            return bestJ, float(w_p50 if w_p50 is not None else lkp0_p50), bestKey, "1D"
+        return 0.0, 0.0, None, "NONE"
+
+    def model_contrib(target_key: str, anchor_key: str):
+        T = as_set(target_key)
+        A = as_set(anchor_key) if anchor_key else set()
+
+        def beta_scaled(icd):
+            # görülmüş değer varsa onu al; yoksa global prior ver
+            val = beta_icd.get(icd, None)
+            if val is None:
+                val = UNSEEN_BETA_PRIOR_FRAC * BETA_MED
+            sup = beta_support.get(icd, 0)
+            return float(val) * (1.0 if sup >= MIN_SUPPORT_FOR_FULL_WEIGHT else SHRINK_1SUPPORT_SCALE)
+
+        def gamma_scaled(i, j):
+            # i-j çifti görülmüşse onu al; yoksa prior
+            val = gamma_pairs.get((i, j), gamma_pairs.get((j, i), None))
+            if val is None:
+                val = UNSEEN_GAMMA_PRIOR_FRAC * GAMMA_MED
+                sup = 0
+            else:
+                sup = max(gamma_support.get((i, j), 0), gamma_support.get((j, i), 0))
+            return float(val) * (1.0 if sup >= MIN_SUPPORT_FOR_FULL_WEIGHT else SHRINK_1SUPPORT_SCALE)
+
+        # T − A: hedefte olup anchorda olmayanlar (eklenen ICD’ler)
+        add_single = sorted(T - A)
+        # A − T: anchorda olup hedefte olmayanlar (çıkan ICD’ler)
+        rem_single = sorted(A - T)
+
+        beta_sum = (
+            sum(beta_scaled(i) for i in add_single)
+            - REMOVAL_PENALTY * sum(beta_scaled(i) for i in rem_single)
+        )
+
+        pairs_T = set(itertools.combinations(sorted(T), 2))
+        pairs_A = set(itertools.combinations(sorted(A), 2))
+        add_pairs = pairs_T - pairs_A
+        rem_pairs = pairs_A - pairs_T
+
+        gamma_sum = (
+            sum(gamma_scaled(i, j) for (i, j) in add_pairs)
+            - REMOVAL_PENALTY * sum(gamma_scaled(i, j) for (i, j) in rem_pairs)
+        )
+
+        # ADDED_ICDS için liste döndürüyoruz
+        return beta_sum, gamma_sum, add_single
+
+    def saturation(total_add:float, k:float=SATURATION_K):
+        return float(k * (1.0 - math.exp(-float(total_add)/float(k)))) if SATURATION_ON else float(total_add)
+
+    # --------- GUARDRAILS (TRAIN + FULL) ---------
+    def guardrails(yg:str, bolum:str, target_key:str, pred:float):
+        T = as_set(target_key)
+        floor_val = float(pred)
+
+        # Pair floor (TRAIN)
+        for i,j in itertools.combinations(sorted(T),2):
+            pf = max(pair_floor_map.get(f"{i}||{j}",0.0), pair_floor_map.get(f"{j}||{i}",0.0))
+            floor_val = max(floor_val, pf)
+
+        # TRAIN floors (subset kapsama)
+        for r in lkp3[(lkp3["YaşGrup"]==yg) & (lkp3["Bölüm"]==bolum)].itertuples():
+            if as_set(r.ICD_Set_Key).issubset(T): floor_val = max(floor_val, float(r.P50))
+        for r in lkp2[lkp2["Bölüm"]==bolum].itertuples():
+            if as_set(r.ICD_Set_Key).issubset(T): floor_val = max(floor_val, float(r.P50))
+        for r in lkp1.itertuples():
+            if as_set(r.ICD_Set_Key).issubset(T): floor_val = max(floor_val, float(r.P50))
+
+        # FULL floors (winsorize edilmiş)
+        if USE_FULL_FOR_EXACT:
+            for r in lkp3_full[(lkp3_full["YaşGrup"]==yg) & (lkp3_full["Bölüm"]==bolum)].itertuples():
+                if as_set(r.ICD_Set_Key).issubset(T): floor_val = max(floor_val, float(r.P50))
+            for r in lkp2_full[lkp2_full["Bölüm"]==bolum].itertuples():
+                if as_set(r.ICD_Set_Key).issubset(T): floor_val = max(floor_val, float(r.P50))
+            for r in lkp1_full.itertuples():
+                if as_set(r.ICD_Set_Key).issubset(T): floor_val = max(floor_val, float(r.P50))
+
+        return float(floor_val)
+
+    def predict_one(yg:str, bolum:str, target_key:str):
+        yg, bolum = canon_demo(yg, bolum)
+        src, anchor_p50, n, anchor_key = find_anchor(yg, bolum, target_key)
+
+        # Birebir eşleşme → short-circuit
+        if anchor_p50 is not None and anchor_key == target_key and not str(src).startswith("NEIGHBOR"):
+            meta = {
+                "ANCHOR_SRC": src, "ANCHOR_KEY": anchor_key or "", "ANCHOR_P50": float(anchor_p50),
+                "ALPHA_JACCARD": 0.0, "ADDED_ICDS": "", "BETA_SUM": 0.0, "GAMMA_SUM": 0.0,
+                "MODEL_PRED": float(anchor_p50), "PRED_BLEND": float(anchor_p50),
+                "PRED_AFTER_GUARDRAILS": float(anchor_p50),
+                "SHORT_CIRCUIT": True, "CAP_APPLIED": False,
+                "IS_SUPERSET_OF_ANCHOR": False
+            }
+            return float(anchor_p50), meta
+
+        # Anchor yoksa komşu (yakın anchor seç, α=Jaccard ile harmanla)
+        if anchor_p50 is None:
+            J, neigh_p50, neigh_key, neigh_src = nearest_neighbor_anchor(yg, bolum, target_key)
+            anchor_p50, anchor_key, src, alpha = float(neigh_p50), neigh_key, f"NEIGHBOR_{neigh_src}", float(J)
+        else:
+            alpha = 0.0
+
+        # Superset mi? (T ⊃ A) -> bağıl katkılar devreye girecek
+        Tset, Aset = as_set(target_key), (as_set(anchor_key) if anchor_key else set())
+        is_superset = (len(Aset) > 0 and Aset.issubset(Tset) and Tset != Aset)
+
+        beta_sum, gamma_sum, added_icds = model_contrib(target_key, anchor_key)
+        add_total = saturation(beta_sum + gamma_sum)
+        model_pred = float(anchor_p50) + add_total
+        pred_blend = (1.0 - alpha) * model_pred + alpha * float(anchor_p50)
+
+        # Guardrails (alt tabanlar)
+        pred_guarded = guardrails(yg, bolum, target_key, pred_blend)
+
+        # 1 gün altı koruma
+        pred_final = float(anchor_p50) if pred_guarded < 1.0 else pred_guarded
+
+        # CAP flag (guardrail fark etti mi?)
+        cap_applied = (abs(pred_guarded - pred_blend) > 1e-9)
+
+        meta = {
+            "ANCHOR_SRC": src,
+            "ANCHOR_KEY": anchor_key or "",
+            "ANCHOR_P50": float(anchor_p50),
+            "ALPHA_JACCARD": float(alpha),
+            "ADDED_ICDS": ",".join(added_icds),  # T − A
+            "BETA_SUM": float(beta_sum),
+            "GAMMA_SUM": float(gamma_sum),
+            "MODEL_PRED": float(model_pred),
+            "PRED_BLEND": float(pred_blend),
+            "PRED_AFTER_GUARDRAILS": float(pred_guarded),
+            "SHORT_CIRCUIT": False,
+            "CAP_APPLIED": bool(cap_applied), 
+            "IS_SUPERSET_OF_ANCHOR": bool(is_superset)
+        }
+        return float(pred_final), meta
+
+    globals()["predict_one"] = predict_one  # aşağıdaki app_* fonksiyonları çağırıyor
+
+    # ================== 7) MODEL ARTEFAKTLARI ==================
+    stage("Model dosyaları yazılıyor")
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    with open(os.path.join(MODEL_DIR, "beta_icd.json"), "w", encoding="utf-8") as f:
+        json.dump(beta_icd, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(MODEL_DIR, "gamma_pairs.json"), "w", encoding="utf-8") as f:
+        json.dump({f"{i}||{j}":v for (i,j), v in gamma_pairs.items()}, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(MODEL_DIR, "config.json"), "w", encoding="utf-8") as f:
+        json.dump({"created_at": datetime.datetime.now().isoformat(),
+                   "min_support": MIN_SUPPORT,
+                   "saturation_on": SATURATION_ON,
+                   "saturation_k": SATURATION_K,
+                   "notes": "Cinsiyetsiz β/γ; α=Jaccard; guardrails aktif; CAP devre dışı"},
+                  f, ensure_ascii=False, indent=2)
+
+    # ================== 7.5) XGB ENSEMBLE ==================
+    if XGB_ENS_ON:
+        stage("XGB (plain+log) eğitiliyor")
+        icd_counts = Counter([icd for lst in train_df["ICD_List_Norm"] for icd in lst])
+        XGB_TOP_ICDS = [icd for icd,_ in icd_counts.most_common(TOPK_ICD)]
+
+        try:
+            ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=True)
+        except TypeError:
+            ohe = OneHotEncoder(handle_unknown="ignore", sparse=True)
+        ohe.fit(train_df[["Bölüm","YaşGrup"]])
+
+        mlb = MultiLabelBinarizer(classes=XGB_TOP_ICDS, sparse_output=True); mlb.fit([XGB_TOP_ICDS])
+
+        def _pack_features(df_part: pd.DataFrame):
+            X_cat = ohe.transform(df_part[["Bölüm","YaşGrup"]])
+            icd_lists = df_part["ICD_List_Norm"].apply(lambda lst: [c for c in lst if c in XGB_TOP_ICDS])
+            X_icd = mlb.transform(icd_lists)
+            x_icd_count = np.asarray(df_part["ICD_Sayısı"]).reshape(-1,1)
+            return hstack([X_cat, X_icd, x_icd_count], format="csr")
+
+        X_train = _pack_features(train_df)
+        y_train = train_df["Yatış Gün Sayısı"].astype(float).values
+        y_log   = np.log1p(y_train)
+
+        xgb_plain = XGBRegressor(**XGB_PARAMS); xgb_log = XGBRegressor(**XGB_PARAMS)
+        xgb_plain.fit(X_train, y_train); xgb_log.fit(X_train, y_log)
+
+        joblib.dump(xgb_plain, os.path.join(MODEL_DIR,"xgb_plain.joblib"))
+        joblib.dump(xgb_log,   os.path.join(MODEL_DIR,"xgb_log.joblib"))
+        joblib.dump(ohe,       os.path.join(MODEL_DIR,"xgb_ohe.joblib"))
+        joblib.dump(mlb,       os.path.join(MODEL_DIR,"xgb_mlb.joblib"))
+        joblib.dump(XGB_TOP_ICDS, os.path.join(MODEL_DIR,"xgb_top_icds.joblib"))
+
+        # global ismi bağla
+        def _xgb_predict_ens(yg, bolum, key, icd_list_norm=None):
+            if icd_list_norm is None:
+                icd_list_norm = key.split("||") if key else []
+            df_one = pd.DataFrame({"Bölüm":[bolum],"YaşGrup":[yg],
+                                   "ICD_List_Norm":[icd_list_norm],"ICD_Sayısı":[len(icd_list_norm)]})
+            X_one = _pack_features(df_one)
+            p_plain = float(xgb_plain.predict(X_one)[0]); p_log = float(np.expm1(xgb_log.predict(X_one)[0]))
+            p_ens = (1.0 - float(XGB_ALPHA_LOG)) * p_plain + float(XGB_ALPHA_LOG) * p_log
+            return p_plain, p_log, p_ens
+
+        xgb_predict_ens = _xgb_predict_ens  # global adına atıyoruz
+    else:
+        # eğitim kapalıysa stub
+        def _xgb_predict_ens(yg, bolum, key, icd_list_norm=None):
+            return np.nan, np.nan, np.nan
+        xgb_predict_ens = _xgb_predict_ens
+
+    globals()["xgb_predict_ens"] = xgb_predict_ens
+
+    # ================== 8) PRED_LOS ==================
+    stage("PRED_LOS.xlsx üretiliyor")
+    uniq_combos_df = df[["YaşGrup","Bölüm","ICD_Set_Key"]].drop_duplicates().reset_index(drop=True)
+
+    pred_rows=[]
+    for r in tqdm(uniq_combos_df.itertuples(), total=len(uniq_combos_df), desc="PRED_LOS"):
+        pred_rule, meta = predict_one(r.YaşGrup, r.Bölüm, r.ICD_Set_Key)
+        icd_list_norm = r.ICD_Set_Key.split("||") if isinstance(r.ICD_Set_Key, str) and r.ICD_Set_Key else []
+        p_plain, p_log, p_ens = xgb_predict_ens(r.YaşGrup, r.Bölüm, r.ICD_Set_Key, icd_list_norm)
+
+        if STRICT_SHORT_CIRCUIT and meta.get("SHORT_CIRCUIT", False):
+            pred_final_out = float(pred_rule)
+        else:
+            if XGB_RULE_BLEND is None or (not np.isfinite(p_ens)):
+                pred_final_out = float(pred_rule)
+            else:
+                w = float(XGB_RULE_BLEND)
+                pred_final_out = (1.0 - w) * float(pred_rule) + w * float(p_ens)
+
+        pred_rows.append({
+            "YaşGrup": r.YaşGrup, "Bölüm": r.Bölüm, "ICD_Set_Key": r.ICD_Set_Key,
+            "Pred_Final": float(pred_final_out),
+            "Pred_Final_Rounded": round_half_up(pred_final_out),
+            "PRED_RULE": float(pred_rule),
+            "PRED_XGB_PLAIN": float(p_plain) if pd.notna(p_plain) else np.nan,
+            "PRED_XGB_LOG":   float(p_log)   if pd.notna(p_log)   else np.nan,
+            "PRED_XGB_ENS":   float(p_ens)   if pd.notna(p_ens)   else np.nan,
+            **meta
+        })
+
+    pd.DataFrame(pred_rows).to_excel(PRED_LOS_XLSX, index=False)
+    print(f"OK -> {PRED_LOS_XLSX}")
+
+    # ================== 9) YeniVakalar ==================
+    if MAKE_YENI_VAKALAR:
+        stage("YeniVakalar.xlsx üretiliyor")
+        yg_vals = df["YaşGrup"].dropna().unique().tolist()
+        bolum_vals = df["Bölüm"].dropna().unique().tolist()
+        icd_counts = Counter([icd for lst in df["ICD_List_Norm"] for icd in lst])
+        top_icds = [icd for icd,_ in icd_counts.most_common(100)]
+
+        def sample_icd_set():
+            k = np.random.randint(1, min(5, max(2, len(top_icds))))
+            return as_key(set(np.random.choice(top_icds, size=k, replace=False)))
+
+        rows=[]
+        for _ in tqdm(range(N_SAMPLES_YENI), desc="YeniVakalar"):
+            yg  = np.random.choice(yg_vals) if yg_vals else "35-50"
+            bol = np.random.choice(bolum_vals) if bolum_vals else "Dahiliye"
+            key = sample_icd_set()
+
+            pred_rule, meta = predict_one(yg, bol, key)
+            icd_list_norm = key.split("||") if key else []
+            _, _, p_ens = xgb_predict_ens(yg, bol, key, icd_list_norm)
+
+            if STRICT_SHORT_CIRCUIT and meta.get("SHORT_CIRCUIT", False):
+                pred_out = float(pred_rule)
+            else:
+                if XGB_RULE_BLEND is None or (not np.isfinite(p_ens)):
+                    pred_out = float(pred_rule)
+                else:
+                    w = float(XGB_RULE_BLEND)
+                    pred_out = (1.0 - w) * float(pred_rule) + w * float(p_ens)
+
+            rows.append({"YaşGrup": yg, "Bölüm": bol, "ICD_Set_Key": key,
+                         "Pred_Final": round_half_up(pred_out), **meta})
+
+        pd.DataFrame(rows).to_excel(YENI_VAKALAR_XLSX, index=False)
+        print(f"OK -> {YENI_VAKALAR_XLSX}")
+
+    # ================== 10) VALID_PREDICTIONS ==================
+    stage("VALID_PREDICTIONS.xlsx üretiliyor (valid set)")
+    valid_rows=[]
+
+    def _norm_col(s: str) -> str:
+        s = unicodedata.normalize("NFKD", s)
+        s = "".join(ch for ch in s if not s or not unicodedata.combining(ch))
+        s = s.lower(); s = re.sub(r"\s+", "_", s); s = re.sub(r"[^a-z0-9_]+", "_", s)
+        return s.strip("_")
+
+    _norm_map = {_norm_col(c): c for c in valid_df.columns}
+    TRUE_LOS_COL = None
+    for c in ["yatis_gun_sayisi","yatis_gun_sayisi_"]:
+        if c in _norm_map: TRUE_LOS_COL = _norm_map[c]; break
+    if TRUE_LOS_COL is None:
+        if "Yatış Gün Sayısı" in valid_df.columns:
+            TRUE_LOS_COL = "Yatış Gün Sayısı"
+        elif "Yatış_Gün_Sayısı" in valid_df.columns:
+            TRUE_LOS_COL = "Yatış_Gün_Sayısı"
+
+    n_3d_valid = 0
+    for r in tqdm(valid_df.itertuples(), total=len(valid_df), desc="VALID_PREDICTIONS"):
+        yg, bol = canon_demo(r.YaşGrup, r.Bölüm)
+        key = r.ICD_Set_Key
+
+        if TRUE_LOS_COL is not None:
+            _val = valid_df.loc[r.Index, TRUE_LOS_COL]
+            try:    true_los = float(_val) if pd.notna(_val) else np.nan
+            except: true_los = np.nan
+        else:
+            true_los = np.nan
 
         pred_rule, meta = predict_one(yg, bol, key)
-        icd_list_norm = key.split("||") if key else []
-        _, _, p_ens = xgb_predict_ens(yg, bol, key, icd_list_norm)
+        if str(meta.get("ANCHOR_SRC", "")).startswith("3D"): n_3d_valid += 1
 
+        icd_list_norm = key.split("||") if isinstance(key, str) and key else []
+        p_plain, p_log, p_ens = xgb_predict_ens(yg, bol, key, icd_list_norm)
+
+        w = 0.5 if globals().get("XGB_RULE_BLEND") is None else float(XGB_RULE_BLEND)
         if STRICT_SHORT_CIRCUIT and meta.get("SHORT_CIRCUIT", False):
             pred_out = float(pred_rule)
         else:
-            if XGB_RULE_BLEND is None or (not np.isfinite(p_ens)):
+            if (p_ens is None) or (not np.isfinite(p_ens)):
                 pred_out = float(pred_rule)
             else:
-                w = float(XGB_RULE_BLEND)
                 pred_out = (1.0 - w) * float(pred_rule) + w * float(p_ens)
 
-        rows.append({"YaşGrup": yg, "Bölüm": bol, "ICD_Set_Key": key,
-                     "Pred_Final": round_half_up(pred_out), **meta})
+        valid_rows.append({
+            "YaşGrup": yg, "Bölüm": bol, "ICD_Set_Key": key,
+            "True_LOS": true_los,
+            "Pred_Final": float(pred_out),
+            "Pred_Final_Rounded": round_half_up(pred_out),
+            "PRED_RULE": float(pred_rule),
+            "PRED_XGB_PLAIN": float(p_plain) if pd.notna(p_plain) else np.nan,
+            "PRED_XGB_LOG":   float(p_log)   if pd.notna(p_log)   else np.nan,
+            "PRED_XGB_ENS":   float(p_ens)   if pd.notna(p_ens)   else np.nan,
+            **meta
+        })
 
-    pd.DataFrame(rows).to_excel(YENI_VAKALAR_XLSX, index=False)
-    print(f"OK -> {YENI_VAKALAR_XLSX}")
+    valid_pred_df = pd.DataFrame(valid_rows)
+    valid_pred_df.to_excel(VALID_PRED_XLSX, index=False)
+    print(f"OK -> {VALID_PRED_XLSX}")
+    print(f"VALID içinde 3D anchor sayısı: {n_3d_valid} satır")
 
-# ================== 10) VALID_PREDICTIONS ==================
-stage("VALID_PREDICTIONS.xlsx üretiliyor (valid set)")
-valid_rows=[]
-
-def _norm_col(s: str) -> str:
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not s or not unicodedata.combining(ch))
-    s = s.lower(); s = re.sub(r"\s+", "_", s); s = re.sub(r"[^a-z0-9_]+", "_", s)
-    return s.strip("_")
-
-_norm_map = {_norm_col(c): c for c in valid_df.columns}
-TRUE_LOS_COL = None
-for c in ["yatis_gun_sayisi","yatis_gun_sayisi_"]:
-    if c in _norm_map: TRUE_LOS_COL = _norm_map[c]; break
-if TRUE_LOS_COL is None:
-    if "Yatış Gün Sayısı" in valid_df.columns:
-        TRUE_LOS_COL = "Yatış Gün Sayısı"
-    elif "Yatış_Gün_Sayısı" in valid_df.columns:
-        TRUE_LOS_COL = "Yatış_Gün_Sayısı"
-
-n_3d_valid = 0
-for r in tqdm(valid_df.itertuples(), total=len(valid_df), desc="VALID_PREDICTIONS"):
-    yg, bol = canon_demo(r.YaşGrup, r.Bölüm)
-    key = r.ICD_Set_Key
-
-    if TRUE_LOS_COL is not None:
-        _val = valid_df.loc[r.Index, TRUE_LOS_COL]
-        try:    true_los = float(_val) if pd.notna(_val) else np.nan
-        except: true_los = np.nan
+    # =============== ÖZET / METRİKLER ===============
+    stage("Özet")
+    if SPLIT_BY_COMBO:
+        print("Split modu: KOMBINASYON (valid'de 3D bekleme).")
     else:
-        true_los = np.nan
+        print("Split modu: SATIR (valid'de 3D mümkün).")
 
-    pred_rule, meta = predict_one(yg, bol, key)
-    if str(meta.get("ANCHOR_SRC", "")).startswith("3D"): n_3d_valid += 1
+    print("Train satır:", len(train_df), "Valid satır:", len(valid_df))
+    print("β (tekil) öğrenilen ICD:", len(beta_icd))
+    print("γ (ikili) öğrenilen pair:", len(gamma_pairs))
 
-    icd_list_norm = key.split("||") if isinstance(key, str) and key else []
-    p_plain, p_log, p_ens = xgb_predict_ens(yg, bol, key, icd_list_norm)
+    for col in ["True_LOS","Pred_Final","PRED_RULE","PRED_XGB_ENS"]:
+        if col in valid_pred_df.columns:
+            valid_pred_df[col] = pd.to_numeric(valid_pred_df[col], errors="coerce")
 
-    w = 0.5 if globals().get("XGB_RULE_BLEND") is None else float(XGB_RULE_BLEND)
-    if STRICT_SHORT_CIRCUIT and meta.get("SHORT_CIRCUIT", False):
-        pred_out = float(pred_rule)
-    else:
-        if (p_ens is None) or (not np.isfinite(p_ens)):
-            pred_out = float(pred_rule)
+    def _metrics(y_true, y_pred, tag):
+        m = y_true.notna() & y_pred.notna()
+        if m.any():
+            yt = y_true[m].astype(float); yp = y_pred[m].astype(float)
+            mae = mean_absolute_error(yt, yp); rmse = math.sqrt(mean_squared_error(yt, yp))
+            print(f"{tag} MAE: {mae:.4f} RMSE: {rmse:.4f}")
         else:
-            pred_out = (1.0 - w) * float(pred_rule) + w * float(p_ens)
+            print(f"{tag}: Geçerli satır yok.")
 
-    valid_rows.append({
-        "YaşGrup": yg, "Bölüm": bol, "ICD_Set_Key": key,
-        "True_LOS": true_los,
-        "Pred_Final": float(pred_out),
-        "Pred_Final_Rounded": round_half_up(pred_out),
-        "PRED_RULE": float(pred_rule),
-        "PRED_XGB_PLAIN": float(p_plain) if pd.notna(p_plain) else np.nan,
-        "PRED_XGB_LOG":   float(p_log)   if pd.notna(p_log)   else np.nan,
-        "PRED_XGB_ENS":   float(p_ens)   if pd.notna(p_ens)   else np.nan,
-        **meta
-    })
-
-valid_pred_df = pd.DataFrame(valid_rows)
-valid_pred_df.to_excel(VALID_PRED_XLSX, index=False)
-print(f"OK -> {VALID_PRED_XLSX}")
-print(f"VALID içinde 3D anchor sayısı: {n_3d_valid} satır")
-
-# =============== ÖZET / METRİKLER ===============
-stage("Özet")
-if SPLIT_BY_COMBO:
-    print("Split modu: KOMBINASYON (valid'de 3D bekleme).")
-else:
-    print("Split modu: SATIR (valid'de 3D mümkün).")
-
-print("Train satır:", len(train_df), "Valid satır:", len(valid_df))
-print("β (tekil) öğrenilen ICD:", len(beta_icd))
-print("γ (ikili) öğrenilen pair:", len(gamma_pairs))
-
-for col in ["True_LOS","Pred_Final","PRED_RULE","PRED_XGB_ENS"]:
-    if col in valid_pred_df.columns:
-        valid_pred_df[col] = pd.to_numeric(valid_pred_df[col], errors="coerce")
-
-def _metrics(y_true, y_pred, tag):
-    m = y_true.notna() & y_pred.notna()
-    if m.any():
-        yt = y_true[m].astype(float); yp = y_pred[m].astype(float)
-        mae = mean_absolute_error(yt, yp); rmse = math.sqrt(mean_squared_error(yt, yp))
-        print(f"{tag} MAE: {mae:.4f} RMSE: {rmse:.4f}")
-    else:
-        print(f"{tag}: Geçerli satır yok.")
-
-_metrics(valid_pred_df["True_LOS"], valid_pred_df["Pred_Final"], "HARMAN (Rule ∘ XGB_ENS)")
-if "PRED_RULE" in valid_pred_df.columns:
-    _metrics(valid_pred_df["True_LOS"], valid_pred_df["PRED_RULE"], "KURAL (Rule)")
-if "PRED_XGB_ENS" in valid_pred_df.columns:
-    _metrics(valid_pred_df["True_LOS"], valid_pred_df["PRED_XGB_ENS"], "XGB (Plain+Log Ens)")
+    _metrics(valid_pred_df["True_LOS"], valid_pred_df["Pred_Final"], "HARMAN (Rule ∘ XGB_ENS)")
+    if "PRED_RULE" in valid_pred_df.columns:
+        _metrics(valid_pred_df["True_LOS"], valid_pred_df["PRED_RULE"], "KURAL (Rule)")
+    if "PRED_XGB_ENS" in valid_pred_df.columns:
+        _metrics(valid_pred_df["True_LOS"], valid_pred_df["PRED_XGB_ENS"], "XGB (Plain+Log Ens)")
 
 # ================== 11) APP KULLANIMI – FONKSİYONLAR ==================
 def app_normalize_inputs(yas_grup: str, bolum: str, icd_input) -> tuple:
@@ -1041,3 +1065,7 @@ def tahmin_et(icd_list, bolum=None, yas_grup=None):
             pred_out = (1.0 - w) * float(pred_rule) + w * float(p_ens)
 
     return {"Pred_Final": float(pred_out), "Pred_Final_Rounded": round_half_up(pred_out)}
+
+# === script olarak çalıştırılırsa eğitimi başlat ===
+if __name__ == "__main__":
+    run_training_pipeline()

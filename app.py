@@ -13,7 +13,7 @@ from fastapi.responses import (
 from pydantic import BaseModel, field_validator
 
 # proje.py'den tahmin fonksiyonları ve dosya adları
-from proje import tahmin_et, app_predict, app_info
+from proje import tahmin_et, app_predict, app_info, run_training_pipeline
 
 # Bu değişkenler proje.py'de global; import başarısızsa varsayılanlara düşeceğiz
 try:
@@ -32,6 +32,13 @@ except Exception:
     MODEL_DIR = "model_out"
 
 app = FastAPI(title="LOS Predictor API", version="1.2.0")
+
+
+# Servis ayağa kalkarken eğitim/pipeline bir kez çalışsın (lookup/map'ler RAM'e yüklensin)
+@app.on_event("startup")
+async def _warmup():
+    # Senkron fonksiyonu burada çağırıyoruz; import sırasında tetiklenmiyor.
+    run_training_pipeline()
 
 
 # -------------------------------
