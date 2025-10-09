@@ -881,8 +881,7 @@ for r in tqdm(valid_df.itertuples(), total=len(valid_df), desc="VALID_PREDICTION
         true_los = np.nan
 
     pred_rule, meta = predict_one(yg, bol, key)
-    if str(meta.get("ANCHOR_SRC","")).startswith("3D"):
-    n_3d_valid += 1
+    if str(meta.get("ANCHOR_SRC", "")).startswith("3D"): n_3d_valid += 1
 
     icd_list_norm = key.split("||") if isinstance(key, str) and key else []
     p_plain, p_log, p_ens = xgb_predict_ens(yg, bol, key, icd_list_norm)
