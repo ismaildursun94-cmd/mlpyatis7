@@ -401,7 +401,7 @@ lkp1_map = {r["ICD_Set_Key"]:(r["P50"], r["N"]) for _,r in lkp1.iterrows()}
 lkp0_p50 = float(lkp0["P50"].iloc[0]) if len(lkp0)>0 else 0.0
 lkp0_p90 = float(lkp0["P90"].iloc[0]) if len(lkp0)>0 else 0.0
 
-# FULL mapler (sadece exact-match short-circuit için; WINSORIZE edilmiş df_full'den)
+# FULL mapler (exact short-circuit ve guardrails için; WINSORIZE edilmiş df_full'den)
 lkp3_full_map = {(r["YaşGrup"], r["Bölüm"], r["ICD_Set_Key"]):(r["P50"], r["N"]) for _,r in lkp3_full.iterrows()}
 lkp2_full_map = {(r["Bölüm"], r["ICD_Set_Key"]):(r["P50"], r["N"]) for _,r in lkp2_full.iterrows()}
 lkp1_full_map = {r["ICD_Set_Key"]:(r["P50"], r["N"]) for _,r in lkp1_full.iterrows()}
@@ -432,7 +432,7 @@ def find_anchor(yg: str, bolum: str, key: str):
         p50, n = train_3d
         return "3D_TRAIN", float(p50), int(n), key
 
-    # --- FULL tarafı (YENİ: winsorize edilmiş df_full + N eşiği) ---
+    # --- FULL tarafı (winsorize full + N eşiği) ---
     if USE_FULL_FOR_EXACT:
         full_1d = lkp1_full_map.get(key)
         if full_1d is not None:
@@ -523,19 +523,34 @@ def model_contrib(target_key:str, anchor_key:str):
 def saturation(total_add:float, k:float=SATURATION_K):
     return float(k * (1.0 - math.exp(-float(total_add)/float(k)))) if SATURATION_ON else float(total_add)
 
+# --------- GUARDRAILS (TRAIN + FULL) ---------
 def guardrails(yg:str, bolum:str, target_key:str, pred:float):
-    T = as_set(target_key); floor2 = pred
+    T = as_set(target_key)
+    floor_val = float(pred)
+
+    # Pair floor (TRAIN)
     for i,j in itertools.combinations(sorted(T),2):
         pf = max(pair_floor_map.get(f"{i}||{j}",0.0), pair_floor_map.get(f"{j}||{i}",0.0))
-        floor2 = max(floor2, pf)
-    floor3 = floor2
+        floor_val = max(floor_val, pf)
+
+    # TRAIN floors (subset kapsama)
     for r in lkp3[(lkp3["YaşGrup"]==yg) & (lkp3["Bölüm"]==bolum)].itertuples():
-        if as_set(r.ICD_Set_Key).issubset(T): floor3 = max(floor3, float(r.P50))
+        if as_set(r.ICD_Set_Key).issubset(T): floor_val = max(floor_val, float(r.P50))
     for r in lkp2[lkp2["Bölüm"]==bolum].itertuples():
-        if as_set(r.ICD_Set_Key).issubset(T): floor3 = max(floor3, float(r.P50))
+        if as_set(r.ICD_Set_Key).issubset(T): floor_val = max(floor_val, float(r.P50))
     for r in lkp1.itertuples():
-        if as_set(r.ICD_Set_Key).issubset(T): floor3 = max(floor3, float(r.P50))
-    return floor3
+        if as_set(r.ICD_Set_Key).issubset(T): floor_val = max(floor_val, float(r.P50))
+
+    # FULL floors (winsorize edilmiş) — aynı mantık
+    if USE_FULL_FOR_EXACT:
+        for r in lkp3_full[(lkp3_full["YaşGrup"]==yg) & (lkp3_full["Bölüm"]==bolum)].itertuples():
+            if as_set(r.ICD_Set_Key).issubset(T): floor_val = max(floor_val, float(r.P50))
+        for r in lkp2_full[lkp2_full["Bölüm"]==bolum].itertuples():
+            if as_set(r.ICD_Set_Key).issubset(T): floor_val = max(floor_val, float(r.P50))
+        for r in lkp1_full.itertuples():
+            if as_set(r.ICD_Set_Key).issubset(T): floor_val = max(floor_val, float(r.P50))
+
+    return float(floor_val)
 
 def predict_one(yg:str, bolum:str, target_key:str):
     yg, bolum = canon_demo(yg, bolum)
@@ -560,8 +575,14 @@ def predict_one(yg:str, bolum:str, target_key:str):
     add_total = saturation(beta_sum + gamma_sum)
     model_pred = float(anchor_p50) + add_total
     pred_blend = (1.0 - alpha) * model_pred + alpha * float(anchor_p50)
-    pred_final = float(anchor_p50) if pred_blend < 1.0 else pred_blend
 
+    # ---- PATCH #3: Guardrails uygula (TRAIN + FULL)
+    pred_guarded = guardrails(yg, bolum, target_key, pred_blend)
+
+    # 1 günü altı saçmalıkları engelle
+    pred_final = float(anchor_p50) if pred_guarded < 1.0 else pred_guarded
+
+    # Üstten cap (demo P90)
     cap_ref = demop90_map.get((yg, bolum), lkp0_p90)
     cap_val = float(cap_ref) * float(CAP_MARJ) if cap_ref is not None else float("inf")
     if cap_val is not None:
@@ -570,7 +591,9 @@ def predict_one(yg:str, bolum:str, target_key:str):
     meta = {"ANCHOR_SRC": src, "ANCHOR_KEY": anchor_key or "", "ANCHOR_P50": float(anchor_p50),
             "ALPHA_JACCARD": float(alpha), "ADDED_ICDS": ",".join(added_icds),
             "BETA_SUM": float(beta_sum), "GAMMA_SUM": float(gamma_sum),
-            "MODEL_PRED": float(model_pred), "PRED_BLEND": float(pred_blend), "SHORT_CIRCUIT": False}
+            "MODEL_PRED": float(model_pred), "PRED_BLEND": float(pred_blend),
+            "PRED_AFTER_GUARDRAILS": float(pred_guarded),
+            "SHORT_CIRCUIT": False}
     return float(pred_final), meta
 
 # ================== 7) MODEL ARTEFAKTLARI ==================
