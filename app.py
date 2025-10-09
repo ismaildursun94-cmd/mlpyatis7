@@ -22,6 +22,12 @@ from proje import tahmin_et, app_predict, app_info, run_training_pipeline
 @app.head("/", response_class=PlainTextResponse)
 def index_head():
     return ""  # 200 OK; Render'ın HEAD health-check'i 405 görmesin
+@app.head("/ready", response_class=PlainTextResponse)
+def ready_head():
+    return ""
+@app.head("/health", response_class=PlainTextResponse)
+def health_head():
+    return ""
 
 try:
     from proje import (
