@@ -560,47 +560,50 @@ def predict_one(yg:str, bolum:str, target_key:str):
             "ANCHOR_SRC": src, "ANCHOR_KEY": anchor_key or "", "ANCHOR_P50": float(anchor_p50),
             "ALPHA_JACCARD": 0.0, "ADDED_ICDS": "", "BETA_SUM": 0.0, "GAMMA_SUM": 0.0,
             "MODEL_PRED": float(anchor_p50), "PRED_BLEND": float(anchor_p50),
-            "SHORT_CIRCUIT": True, "CAP_APPLIED": False
+            "PRED_AFTER_GUARDRAILS": float(anchor_p50),
+            "SHORT_CIRCUIT": True, "CAP_APPLIED": False,
+            "IS_SUPERSET_OF_ANCHOR": False
         }
         return float(anchor_p50), meta
 
-    # Anchor yoksa komşu
+    # Anchor yoksa komşu (yakın anchor seç, α=Jaccard ile harmanla)
     if anchor_p50 is None:
         J, neigh_p50, neigh_key, neigh_src = nearest_neighbor_anchor(yg, bolum, target_key)
         anchor_p50, anchor_key, src, alpha = float(neigh_p50), neigh_key, f"NEIGHBOR_{neigh_src}", float(J)
     else:
         alpha = 0.0
 
+    # Superset mi? (T ⊃ A) -> bağıl katkılar devreye girecek
+    Tset, Aset = as_set(target_key), (as_set(anchor_key) if anchor_key else set())
+    is_superset = (len(Aset) > 0 and Aset.issubset(Tset) and Tset != Aset)
+
     beta_sum, gamma_sum, added_icds = model_contrib(target_key, anchor_key)
     add_total = saturation(beta_sum + gamma_sum)
     model_pred = float(anchor_p50) + add_total
     pred_blend = (1.0 - alpha) * model_pred + alpha * float(anchor_p50)
 
-    # Guardrails uygula (alt sınırlar)
+    # Guardrails (alt tabanlar)
     pred_guarded = guardrails(yg, bolum, target_key, pred_blend)
 
-    # 1 gün altı saçmalığı engelle
+    # 1 gün altı koruma
     pred_final = float(anchor_p50) if pred_guarded < 1.0 else pred_guarded
 
-    # IMPORTANT: Üstten cap (demo P90) artık UYGULANMIYOR.
-    # cap_ref = demop90_map.get((yg, bolum), None)
-    # if cap_ref is not None:
-    #     cap_val = float(cap_ref) * float(CAP_MARJ)
-    #     pred_final = min(float(pred_final), float(cap_val))
+    # ÜSTTEN CAP YOK (kaldırıldı)
 
     meta = {
         "ANCHOR_SRC": src,
         "ANCHOR_KEY": anchor_key or "",
         "ANCHOR_P50": float(anchor_p50),
         "ALPHA_JACCARD": float(alpha),
-        "ADDED_ICDS": ",".join(added_icds),
+        "ADDED_ICDS": ",".join(added_icds),  # T − A
         "BETA_SUM": float(beta_sum),
         "GAMMA_SUM": float(gamma_sum),
         "MODEL_PRED": float(model_pred),
         "PRED_BLEND": float(pred_blend),
         "PRED_AFTER_GUARDRAILS": float(pred_guarded),
         "SHORT_CIRCUIT": False,
-        "CAP_APPLIED": False
+        "CAP_APPLIED": False,
+        "IS_SUPERSET_OF_ANCHOR": bool(is_superset)
     }
     return float(pred_final), meta
 
