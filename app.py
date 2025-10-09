@@ -1,6 +1,7 @@
 # app.py
 import os
 import re
+import threading
 from typing import List, Optional, Union
 
 from fastapi import FastAPI, HTTPException, Form
@@ -33,12 +34,39 @@ except Exception:
 
 app = FastAPI(title="LOS Predictor API", version="1.2.0")
 
+# ---- Isınma durumu (global bayrak) ----
+MODEL_READY: bool = False
+MODEL_MODE: str = os.environ.get("MODE", "train").lower()  # "train" | "load" (ileride load_from_artifacts eklenebilir)
+MODEL_ERROR: Optional[str] = None
 
-# Servis ayağa kalkarken eğitim/pipeline bir kez çalışsın (lookup/map'ler RAM'e yüklensin)
+
+def _background_warmup():
+    """
+    Ağır işlemi (eğitim/ısıtma) ana thread'i bloklamadan çalıştır.
+    Render gibi platformlarda port taraması böylece zaman aşımına düşmez.
+    """
+    global MODEL_READY, MODEL_ERROR
+    try:
+        if MODEL_MODE == "train":
+            print("[WARMUP] Training pipeline starting...")
+            run_training_pipeline()
+            print("[WARMUP] Training pipeline done.")
+        else:
+            # Buraya ileride load_from_artifacts(LOOKUP_XLSX, MODEL_DIR) koyabiliriz
+            print("[WARMUP] Load mode selected, but loader not implemented yet; running training as fallback.")
+            run_training_pipeline()
+        MODEL_READY = True
+        MODEL_ERROR = None
+    except Exception as e:
+        MODEL_ERROR = f"{type(e).__name__}: {e}"
+        MODEL_READY = False
+        print("[WARMUP][ERROR]", MODEL_ERROR)
+
+
+# Sunucu ayağa kalkarken arka planda ısınma başlat
 @app.on_event("startup")
 async def _warmup():
-    # Senkron fonksiyonu burada çağırıyoruz; import sırasında tetiklenmiyor.
-    run_training_pipeline()
+    threading.Thread(target=_background_warmup, daemon=True).start()
 
 
 # -------------------------------
@@ -101,10 +129,12 @@ def index():
             label { font-size: 12px; color: #bbb; }
             small { color:#b9a97c }
             a.dl { color:#9ad; text-decoration:none; }
+            .muted { color:#aaa; font-size:12px; }
         </style>
     </head>
     <body>
         <h2>LOS Tahmin Arayüzü</h2>
+        <div class="muted">Sunucu durumu: <span id="ready">kontrol ediliyor…</span></div>
         <form id="predictForm">
             <label>ICD Listesi (virgül, ||, boşluk vs. hepsi olur):</label>
             <input type="text" id="icd_list" name="icd_list" value="A00||C91.0 T81.4, Z94.8">
@@ -133,6 +163,17 @@ def index():
         </p>
 
         <script>
+        async function pingReady(){
+          try{
+            const r = await fetch("/ready");
+            const j = await r.json();
+            document.getElementById("ready").textContent = j.ready ? "hazır" : (j.error ? "hata: "+j.error : "ısınma");
+          }catch(e){
+            document.getElementById("ready").textContent = "bilinmiyor";
+          }
+        }
+        pingReady(); setInterval(pingReady, 2000);
+
         function splitAny(s) {
           if (!s) return [];
           s = s.replaceAll("||","|");
@@ -181,6 +222,10 @@ def index():
 def health():
     return {"status": "up", "service": "los-predictor", "version": app.version}
 
+@app.get("/ready", response_class=JSONResponse)
+def ready():
+    return {"ready": MODEL_READY, "mode": MODEL_MODE, "error": MODEL_ERROR}
+
 
 @app.get("/info", response_class=JSONResponse)
 def info():
@@ -196,6 +241,11 @@ def info():
 @app.post("/predict", response_class=PlainTextResponse)
 def predict(req: PredictRequest):
     """Sadece sayısal değer döndürür (Pred_Final_Rounded)."""
+    if not MODEL_READY:
+        # Eğitim bitmeden tahmin isteme → 503
+        msg = "Model hazır değil (ısınma sürüyor)." + (f" Hata: {MODEL_ERROR}" if MODEL_ERROR else "")
+        raise HTTPException(status_code=503, detail=msg)
+
     try:
         out = tahmin_et(req.icd_list, req.bolum, req.yas_grup)
         val = out.get("Pred_Final_Rounded", None)
@@ -212,6 +262,10 @@ def predict(req: PredictRequest):
 @app.post("/predict_json", response_class=JSONResponse)
 def predict_json(req: PredictRequest):
     """Tüm detayları (ANCHOR_SRC, ANCHOR_P50, model skorları, final harman) döndürür."""
+    if not MODEL_READY:
+        msg = "Model hazır değil (ısınma sürüyor)." + (f" Hata: {MODEL_ERROR}" if MODEL_ERROR else "")
+        raise HTTPException(status_code=503, detail=msg)
+
     try:
         out = app_predict(req.yas_grup or "", req.bolum or "", req.icd_list)
         return out
@@ -267,6 +321,10 @@ def tahmin_form(
     bolum: Optional[str] = Form(None),
     yas_grup: Optional[str] = Form(None),
 ):
+    if not MODEL_READY:
+        msg = "Model hazır değil (ısınma sürüyor)." + (f" Hata: {MODEL_ERROR}" if MODEL_ERROR else "")
+        raise HTTPException(status_code=503, detail=msg)
+
     try:
         # Formdan gelen serbest metni de aynı kuralla parçala
         s = re.sub(r"\|\|", "|", icd_text or "")
@@ -281,10 +339,9 @@ def tahmin_form(
 
 
 # -------------------------------
-# 8) Çalıştırıcı
+# 8) Çalıştırıcı (lokal)
 # -------------------------------
 if __name__ == "__main__":
     import uvicorn
-
     port = int(os.environ.get("PORT", "10000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, workers=1)
