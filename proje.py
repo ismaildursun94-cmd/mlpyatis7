@@ -75,7 +75,7 @@ XGB_PARAMS = dict(
 )
 
 STRICT_SHORT_CIRCUIT = True
-PREFER_TRAIN_FOR_EXACT = True
+PREFER_TRAIN_FOR_EXACT = False
 USE_FULL_FOR_EXACT = True          # ← FULL exact kısa devreyi kullan
 FULL_MIN_N = 1                     # ← N eşiği (FULL short-circuit için)
 # ====================================================
