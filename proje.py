@@ -71,7 +71,7 @@ WINSOR_HI          = 0.9785
 
 XGB_ENS_ON         = True
 XGB_ALPHA_LOG      = 0.20
-XGB_RULE_BLEND     = 0.00
+XGB_RULE_BLEND     = 0.60
 XGB_PARAMS = dict(
     n_estimators=400, learning_rate=0.05, max_depth=6,
     subsample=0.8, colsample_bytree=0.8,
