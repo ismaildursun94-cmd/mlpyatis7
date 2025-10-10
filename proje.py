@@ -1,4 +1,3 @@
-# los_predict_no_cap.py
 # -*- coding: utf-8 -*-
 
 import os, json, re, warnings, datetime, itertools, math, random, unicodedata
@@ -34,6 +33,11 @@ random.seed(42); np.random.seed(42)
 EXCEL_PATH         = "Veri2024.xlsx"
 LOOKUP_XLSX        = "LOS_Lookup_All.xlsx"
 MODEL_DIR          = "model_out"
+
+# --- YENİ: çıktı üretim anahtarları ---
+GENERATE_LOOKUP_EXCEL       = True   # Lookup Excel'i yaz
+GENERATE_PRED_LOS           = False  # PRED_LOS.xlsx üret
+GENERATE_VALID_PREDICTIONS  = False  # VALID_PREDICTIONS.xlsx üret
 
 MAKE_YENI_VAKALAR  = True
 YENI_VAKALAR_XLSX  = "YeniVakalar.xlsx"
@@ -371,7 +375,7 @@ def run_training_pipeline():
             if icd in single_map: base_candidates.append(single_map[icd])
             if icd in one_map:    base_candidates.append(one_map.get(icd, 0.0))
             base = max(base_candidates) if base_candidates else 0.0
-            delta = max(0.0, float(p50) - float(base))
+            delta = float(p50) - float(base)
             icd_to_beta_samples[icd].append(delta)
 
     beta_icd, beta_support = {}, {}
@@ -384,7 +388,7 @@ def run_training_pipeline():
     for _, row in LKP_PAIR.iterrows():
         i, j = row["PairKey"].split("||"); p50 = row["P50"]
         base = max(single_map.get(i, 0.0), single_map.get(j, 0.0))
-        delta = max(0.0, float(p50) - float(base))
+        delta = float(p50) - float(base)
         pair_to_gamma_samples[(i,j)].append(delta)
         pair_to_gamma_samples[(j,i)].append(delta)
 
@@ -398,7 +402,8 @@ def run_training_pipeline():
     GAMMA_MED = float(np.median(list(gamma_pairs.values()))) if len(gamma_pairs) else 0.0
 
     # ================== 5) LOOKUP EXCEL ==================
-    stage("Lookup Excel yazılıyor")
+    if GENERATE_LOOKUP_EXCEL:
+        stage("Lookup Excel yazılıyor")
     _br_base = df[["ICD_Set_Key","ICD_List_Norm"]].copy()
     BR_ICDSET_MAP = (_br_base.explode("ICD_List_Norm")
                      .rename(columns={"ICD_List_Norm":"ICD"})
@@ -409,22 +414,23 @@ def run_training_pipeline():
     _present = [yg for yg in _age_order if yg in set(df["YaşGrup"].dropna().astype(str).unique())]
     DIM_YASGRUP = pd.DataFrame({"YaşGrup": _present})
 
-    with pd.ExcelWriter(LOOKUP_XLSX, engine="xlsxwriter") as w:
-        lkp3.to_excel(w, index=False, sheet_name="LKP_3D_YasGrup_TRAIN")
-        lkp2.to_excel(w, index=False, sheet_name="LKP_2D_TRAIN")
-        lkp1.to_excel(w, index=False, sheet_name="LKP_1D_TRAIN")
-        lkp0.to_excel(w, index=False, sheet_name="LKP_0D_TRAIN")
+    if GENERATE_LOOKUP_EXCEL:
+        with pd.ExcelWriter(LOOKUP_XLSX, engine="xlsxwriter") as w:
+            lkp3.to_excel(w, index=False, sheet_name="LKP_3D_YasGrup_TRAIN")
+            lkp2.to_excel(w, index=False, sheet_name="LKP_2D_TRAIN")
+            lkp1.to_excel(w, index=False, sheet_name="LKP_1D_TRAIN")
+            lkp0.to_excel(w, index=False, sheet_name="LKP_0D_TRAIN")
 
-        lkp3_full.to_excel(w, index=False, sheet_name="LKP_3D_FULL")
-        lkp2_full.to_excel(w, index=False, sheet_name="LKP_2D_FULL")
-        lkp1_full.to_excel(w, index=False, sheet_name="LKP_1D_FULL")
+            lkp3_full.to_excel(w, index=False, sheet_name="LKP_3D_FULL")
+            lkp2_full.to_excel(w, index=False, sheet_name="LKP_2D_FULL")
+            lkp1_full.to_excel(w, index=False, sheet_name="LKP_1D_FULL")
 
-        LKP_ICD.to_excel(w, index=False, sheet_name="LKP_ICD_TRAIN")
-        df[["ICD_Text_Embed"]].to_excel(w, index=False, sheet_name="TEXT_EMB_SOURCE")
-        BR_ICDSET_MAP.to_excel(w, index=False, sheet_name="BR_ICDSET_MAP")
-        DIM_ICD.to_excel(w, index=False, sheet_name="DIM_ICD")
-        DIM_YASGRUP.to_excel(w, index=False, sheet_name="DIM_YASGRUP")
-    print(f"OK -> {LOOKUP_XLSX}")
+            LKP_ICD.to_excel(w, index=False, sheet_name="LKP_ICD_TRAIN")
+            df[["ICD_Text_Embed"]].to_excel(w, index=False, sheet_name="TEXT_EMB_SOURCE")
+            BR_ICDSET_MAP.to_excel(w, index=False, sheet_name="BR_ICDSET_MAP")
+            DIM_ICD.to_excel(w, index=False, sheet_name="DIM_ICD")
+            DIM_YASGRUP.to_excel(w, index=False, sheet_name="DIM_YASGRUP")
+        print(f"OK -> {LOOKUP_XLSX}")
 
     # ================== 6) ANCHOR / PREDICT ==================
     stage("Prediction yardımcı yapılar")
@@ -688,7 +694,8 @@ def run_training_pipeline():
                 "MODEL_PRED": float(anchor_p50), "PRED_BLEND": float(anchor_p50),
                 "PRED_AFTER_GUARDRAILS": float(anchor_p50),
                 "SHORT_CIRCUIT": True, "CAP_APPLIED": False,
-                "IS_SUPERSET_OF_ANCHOR": False
+                "IS_SUPERSET_OF_ANCHOR": False,
+                "NEGATIVE_CONTRIB_ROLLEDBACK": False
             }
             return float(anchor_p50), meta
 
@@ -711,8 +718,21 @@ def run_training_pipeline():
         # Guardrails (alt tabanlar)
         pred_guarded = guardrails(yg, bolum, target_key, pred_blend)
 
-        # 1 gün altı koruma
-        pred_final = float(anchor_p50) if pred_guarded < 1.0 else pred_guarded
+        # === Negatif katkılar: <1'e yuvarlanıyorsa rollback ===
+        neg_rb = False
+        pred_final = float(pred_guarded)  # önce negatif katkılar dahil
+        if (round_half_up(pred_final) is not None) and (round_half_up(pred_final) < 1):
+            beta_pos  = max(0.0, float(beta_sum))
+            gamma_pos = max(0.0, float(gamma_sum))
+            add_total_pos = saturation(beta_pos + gamma_pos)
+
+            model_pred_pos = float(anchor_p50) + add_total_pos
+            pred_blend_pos = (1.0 - alpha) * model_pred_pos + alpha * float(anchor_p50)
+            pred_guarded_pos = guardrails(yg, bolum, target_key, pred_blend_pos)
+
+            pred_final = float(pred_guarded_pos)
+            neg_rb = True
+        # === SON ===
 
         # CAP flag (guardrail fark etti mi?)
         cap_applied = (abs(pred_guarded - pred_blend) > 1e-9)
@@ -729,8 +749,9 @@ def run_training_pipeline():
             "PRED_BLEND": float(pred_blend),
             "PRED_AFTER_GUARDRAILS": float(pred_guarded),
             "SHORT_CIRCUIT": False,
-            "CAP_APPLIED": bool(cap_applied), 
-            "IS_SUPERSET_OF_ANCHOR": bool(is_superset)
+            "CAP_APPLIED": bool(cap_applied),
+            "IS_SUPERSET_OF_ANCHOR": bool(is_superset),
+            "NEGATIVE_CONTRIB_ROLLEDBACK": bool(neg_rb)
         }
         return float(pred_final), meta
 
@@ -806,37 +827,38 @@ def run_training_pipeline():
     globals()["xgb_predict_ens"] = xgb_predict_ens
 
     # ================== 8) PRED_LOS ==================
-    stage("PRED_LOS.xlsx üretiliyor")
-    uniq_combos_df = df[["YaşGrup","Bölüm","ICD_Set_Key"]].drop_duplicates().reset_index(drop=True)
+    if GENERATE_PRED_LOS:
+        stage("PRED_LOS.xlsx üretiliyor")
+        uniq_combos_df = df[["YaşGrup","Bölüm","ICD_Set_Key"]].drop_duplicates().reset_index(drop=True)
 
-    pred_rows=[]
-    for r in tqdm(uniq_combos_df.itertuples(), total=len(uniq_combos_df), desc="PRED_LOS"):
-        pred_rule, meta = predict_one(r.YaşGrup, r.Bölüm, r.ICD_Set_Key)
-        icd_list_norm = r.ICD_Set_Key.split("||") if isinstance(r.ICD_Set_Key, str) and r.ICD_Set_Key else []
-        p_plain, p_log, p_ens = xgb_predict_ens(r.YaşGrup, r.Bölüm, r.ICD_Set_Key, icd_list_norm)
+        pred_rows=[]
+        for r in tqdm(uniq_combos_df.itertuples(), total=len(uniq_combos_df), desc="PRED_LOS"):
+            pred_rule, meta = predict_one(r.YaşGrup, r.Bölüm, r.ICD_Set_Key)
+            icd_list_norm = r.ICD_Set_Key.split("||") if isinstance(r.ICD_Set_Key, str) and r.ICD_Set_Key else []
+            p_plain, p_log, p_ens = xgb_predict_ens(r.YaşGrup, r.Bölüm, r.ICD_Set_Key, icd_list_norm)
 
-        if STRICT_SHORT_CIRCUIT and meta.get("SHORT_CIRCUIT", False):
-            pred_final_out = float(pred_rule)
-        else:
-            if XGB_RULE_BLEND is None or (not np.isfinite(p_ens)):
+            if STRICT_SHORT_CIRCUIT and meta.get("SHORT_CIRCUIT", False):
                 pred_final_out = float(pred_rule)
             else:
-                w = float(XGB_RULE_BLEND)
-                pred_final_out = (1.0 - w) * float(pred_rule) + w * float(p_ens)
+                if XGB_RULE_BLEND is None or (not np.isfinite(p_ens)):
+                    pred_final_out = float(pred_rule)
+                else:
+                    w = float(XGB_RULE_BLEND)
+                    pred_final_out = (1.0 - w) * float(pred_rule) + w * float(p_ens)
 
-        pred_rows.append({
-            "YaşGrup": r.YaşGrup, "Bölüm": r.Bölüm, "ICD_Set_Key": r.ICD_Set_Key,
-            "Pred_Final": float(pred_final_out),
-            "Pred_Final_Rounded": round_half_up(pred_final_out),
-            "PRED_RULE": float(pred_rule),
-            "PRED_XGB_PLAIN": float(p_plain) if pd.notna(p_plain) else np.nan,
-            "PRED_XGB_LOG":   float(p_log)   if pd.notna(p_log)   else np.nan,
-            "PRED_XGB_ENS":   float(p_ens)   if pd.notna(p_ens)   else np.nan,
-            **meta
-        })
+            pred_rows.append({
+                "YaşGrup": r.YaşGrup, "Bölüm": r.Bölüm, "ICD_Set_Key": r.ICD_Set_Key,
+                "Pred_Final": float(pred_final_out),
+                "Pred_Final_Rounded": round_half_up(pred_final_out),
+                "PRED_RULE": float(pred_rule),
+                "PRED_XGB_PLAIN": float(p_plain) if pd.notna(p_plain) else np.nan,
+                "PRED_XGB_LOG":   float(p_log)   if pd.notna(p_log)   else np.nan,
+                "PRED_XGB_ENS":   float(p_ens)   if pd.notna(p_ens)   else np.nan,
+                **meta
+            })
 
-    pd.DataFrame(pred_rows).to_excel(PRED_LOS_XLSX, index=False)
-    print(f"OK -> {PRED_LOS_XLSX}")
+        pd.DataFrame(pred_rows).to_excel(PRED_LOS_XLSX, index=False)
+        print(f"OK -> {PRED_LOS_XLSX}")
 
     # ================== 9) YeniVakalar ==================
     if MAKE_YENI_VAKALAR:
@@ -876,7 +898,8 @@ def run_training_pipeline():
         print(f"OK -> {YENI_VAKALAR_XLSX}")
 
     # ================== 10) VALID_PREDICTIONS ==================
-    stage("VALID_PREDICTIONS.xlsx üretiliyor (valid set)")
+    if GENERATE_VALID_PREDICTIONS:
+        stage("VALID_PREDICTIONS.xlsx üretiliyor (valid set)")
     valid_rows=[]
 
     def _norm_col(s: str) -> str:
@@ -922,52 +945,54 @@ def run_training_pipeline():
             else:
                 pred_out = (1.0 - w) * float(pred_rule) + w * float(p_ens)
 
-        valid_rows.append({
-            "YaşGrup": yg, "Bölüm": bol, "ICD_Set_Key": key,
-            "True_LOS": true_los,
-            "Pred_Final": float(pred_out),
-            "Pred_Final_Rounded": round_half_up(pred_out),
-            "PRED_RULE": float(pred_rule),
-            "PRED_XGB_PLAIN": float(p_plain) if pd.notna(p_plain) else np.nan,
-            "PRED_XGB_LOG":   float(p_log)   if pd.notna(p_log)   else np.nan,
-            "PRED_XGB_ENS":   float(p_ens)   if pd.notna(p_ens)   else np.nan,
-            **meta
-        })
+        if GENERATE_VALID_PREDICTIONS:
+            valid_rows.append({
+                "YaşGrup": yg, "Bölüm": bol, "ICD_Set_Key": key,
+                "True_LOS": true_los,
+                "Pred_Final": float(pred_out),
+                "Pred_Final_Rounded": round_half_up(pred_out),
+                "PRED_RULE": float(pred_rule),
+                "PRED_XGB_PLAIN": float(p_plain) if pd.notna(p_plain) else np.nan,
+                "PRED_XGB_LOG":   float(p_log)   if pd.notna(p_log)   else np.nan,
+                "PRED_XGB_ENS":   float(p_ens)   if pd.notna(p_ens)   else np.nan,
+                **meta
+            })
 
-    valid_pred_df = pd.DataFrame(valid_rows)
-    valid_pred_df.to_excel(VALID_PRED_XLSX, index=False)
-    print(f"OK -> {VALID_PRED_XLSX}")
-    print(f"VALID içinde 3D anchor sayısı: {n_3d_valid} satır")
+    if GENERATE_VALID_PREDICTIONS:
+        valid_pred_df = pd.DataFrame(valid_rows)
+        valid_pred_df.to_excel(VALID_PRED_XLSX, index=False)
+        print(f"OK -> {VALID_PRED_XLSX}")
+        print(f"VALID içinde 3D anchor sayısı: {n_3d_valid} satır")
 
-    # =============== ÖZET / METRİKLER ===============
-    stage("Özet")
-    if SPLIT_BY_COMBO:
-        print("Split modu: KOMBINASYON (valid'de 3D bekleme).")
-    else:
-        print("Split modu: SATIR (valid'de 3D mümkün).")
-
-    print("Train satır:", len(train_df), "Valid satır:", len(valid_df))
-    print("β (tekil) öğrenilen ICD:", len(beta_icd))
-    print("γ (ikili) öğrenilen pair:", len(gamma_pairs))
-
-    for col in ["True_LOS","Pred_Final","PRED_RULE","PRED_XGB_ENS"]:
-        if col in valid_pred_df.columns:
-            valid_pred_df[col] = pd.to_numeric(valid_pred_df[col], errors="coerce")
-
-    def _metrics(y_true, y_pred, tag):
-        m = y_true.notna() & y_pred.notna()
-        if m.any():
-            yt = y_true[m].astype(float); yp = y_pred[m].astype(float)
-            mae = mean_absolute_error(yt, yp); rmse = math.sqrt(mean_squared_error(yt, yp))
-            print(f"{tag} MAE: {mae:.4f} RMSE: {rmse:.4f}")
+        # =============== ÖZET / METRİKLER ===============
+        stage("Özet")
+        if SPLIT_BY_COMBO:
+            print("Split modu: KOMBINASYON (valid'de 3D bekleme).")
         else:
-            print(f"{tag}: Geçerli satır yok.")
+            print("Split modu: SATIR (valid'de 3D mümkün).")
 
-    _metrics(valid_pred_df["True_LOS"], valid_pred_df["Pred_Final"], "HARMAN (Rule ∘ XGB_ENS)")
-    if "PRED_RULE" in valid_pred_df.columns:
-        _metrics(valid_pred_df["True_LOS"], valid_pred_df["PRED_RULE"], "KURAL (Rule)")
-    if "PRED_XGB_ENS" in valid_pred_df.columns:
-        _metrics(valid_pred_df["True_LOS"], valid_pred_df["PRED_XGB_ENS"], "XGB (Plain+Log Ens)")
+        print("Train satır:", len(train_df), "Valid satır:", len(valid_df))
+        print("β (tekil) öğrenilen ICD:", len(beta_icd))
+        print("γ (ikili) öğrenilen pair:", len(gamma_pairs))
+
+        for col in ["True_LOS","Pred_Final","PRED_RULE","PRED_XGB_ENS"]:
+            if col in valid_pred_df.columns:
+                valid_pred_df[col] = pd.to_numeric(valid_pred_df[col], errors="coerce")
+
+        def _metrics(y_true, y_pred, tag):
+            m = y_true.notna() & y_pred.notna()
+            if m.any():
+                yt = y_true[m].astype(float); yp = y_pred[m].astype(float)
+                mae = mean_absolute_error(yt, yp); rmse = math.sqrt(mean_squared_error(yt, yp))
+                print(f"{tag} MAE: {mae:.4f} RMSE: {rmse:.4f}")
+            else:
+                print(f"{tag}: Geçerli satır yok.")
+
+        _metrics(valid_pred_df["True_LOS"], valid_pred_df["Pred_Final"], "HARMAN (Rule ∘ XGB_ENS)")
+        if "PRED_RULE" in valid_pred_df.columns:
+            _metrics(valid_pred_df["True_LOS"], valid_pred_df["PRED_RULE"], "KURAL (Rule)")
+        if "PRED_XGB_ENS" in valid_pred_df.columns:
+            _metrics(valid_pred_df["True_LOS"], valid_pred_df["PRED_XGB_ENS"], "XGB (Plain+Log Ens)")
 
 # ================== 11) APP KULLANIMI – FONKSİYONLAR ==================
 def app_normalize_inputs(yas_grup: str, bolum: str, icd_input) -> tuple:
