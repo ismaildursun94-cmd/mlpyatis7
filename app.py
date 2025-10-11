@@ -5,27 +5,33 @@ import threading
 from typing import List, Optional, Union
 
 from fastapi import FastAPI, HTTPException, Form
-from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse, FileResponse
+from fastapi.responses import (
+    HTMLResponse,
+    PlainTextResponse,
+    JSONResponse,
+    FileResponse,
+)
 from pydantic import BaseModel, field_validator
 
-# === Proje fonksiyonları (model) ===
-from proje import tahmin_et, run_training_pipeline  # app_info kaldırıldı
+# ==== MODEL / PROJE ====
+from proje import tahmin_et, app_predict, run_training_pipeline
 
-# ---- Sabitler (dosya adları) ----
-LOOKUP_XLSX     = os.environ.get("LOOKUP_XLSX", "LOS_Lookup_All.xlsx")
-PRED_LOS_XLSX   = os.environ.get("PRED_LOS_XLSX", "PRED_LOS.xlsx")
+# ---- Sabitler (fallback) ----
+LOOKUP_XLSX = os.environ.get("LOOKUP_XLSX", "LOS_Lookup_All.xlsx")
+PRED_LOS_XLSX = os.environ.get("PRED_LOS_XLSX", "PRED_LOS.xlsx")
 VALID_PRED_XLSX = os.environ.get("VALID_PRED_XLSX", "VALID_PREDICTIONS.xlsx")
 YENI_VAKALAR_XLSX = os.environ.get("YENI_VAKALAR_XLSX", "YeniVakalar.xlsx")
-MODEL_DIR       = os.environ.get("MODEL_DIR", "model_out")
+MODEL_DIR = os.environ.get("MODEL_DIR", "model_out")
 
 # ============================================================
 #                FASTAPI (API) + MODEL ISINMA
 # ============================================================
-app = FastAPI(title="LOS Predictor API", version="1.2.0")
+app = FastAPI(title="LOS Predictor API", version="1.3.0")
 
 MODEL_READY: bool = False
-MODEL_MODE: str = os.environ.get("MODE", "train").lower()  # "train" | "load"
+MODEL_MODE: str = os.environ.get("MODE", "train").lower()  # "train" | "load" (şimdilik train)
 MODEL_ERROR: Optional[str] = None
+
 
 def _background_warmup():
     """Ağır eğitimi ana thread'i bloklamadan çalıştır."""
@@ -36,7 +42,7 @@ def _background_warmup():
             run_training_pipeline()
             print("[WARMUP] Training pipeline done.")
         else:
-            print("[WARMUP] Load mode selected, but loader not implemented yet; running training as fallback.")
+            print("[WARMUP] Load mode not implemented; running training as fallback.")
             run_training_pipeline()
         MODEL_READY = True
         MODEL_ERROR = None
@@ -45,9 +51,11 @@ def _background_warmup():
         MODEL_ERROR = f"{type(e).__name__}: {e}"
         print("[WARMUP][ERROR]", MODEL_ERROR)
 
+
 @app.on_event("startup")
 async def _warmup():
     threading.Thread(target=_background_warmup, daemon=True).start()
+
 
 # ---------------- HEAD (Render health-check) ----------------
 @app.head("/",  response_class=PlainTextResponse)
@@ -58,6 +66,7 @@ def ready_head():  return ""
 
 @app.head("/health", response_class=PlainTextResponse)
 def health_head(): return ""
+
 
 # ---------------- Tahmin request modeli ----------------
 class PredictRequest(BaseModel):
@@ -91,99 +100,113 @@ class PredictRequest(BaseModel):
             raise ValueError("icd_list boş olamaz")
         return v
 
+
 # ---------------- Ana sayfa (basit form) ----------------
 @app.get("/", response_class=HTMLResponse)
 def index():
     return """
     <html>
     <head>
-      <title>LOS Predictor</title>
-      <meta charset="utf-8">
-      <style>
-        body { font-family: Arial, sans-serif; max-width: 620px; margin: 40px auto;
-               background: #2f2f2f; color: #eee; padding: 24px; border-radius: 12px; }
-        a.ui { display:inline-block; margin-bottom:14px; color:#9ad; }
-        input, button { padding: 12px; margin-top: 8px; width: 100%; box-sizing: border-box;
-                        border-radius: 8px; border: 1px solid #555; background:#3b3b3b; color:#eee; }
-        button { background: #0a66ff; color: #fff; border: none; cursor: pointer; font-weight: 700; }
-        button:hover { background: #0a55d3; }
-        #result { font-size: 32px; font-weight: 800; margin-top: 16px; }
-        label { font-size: 12px; color: #bbb; }
-        small { color:#b9a97c }
-        a.dl { color:#9ad; text-decoration:none; }
-        .muted { color:#aaa; font-size:12px; }
-      </style>
+        <title>LOS Predictor</title>
+        <meta charset="utf-8">
+        <style>
+            body { font-family: Arial, sans-serif; max-width: 620px; margin: 40px auto;
+                   background: #2f2f2f; color: #eee; padding: 24px; border-radius: 12px; }
+            a.ui { display:inline-block; margin-bottom:14px; color:#9ad; }
+            input, button { padding: 12px; margin-top: 8px; width: 100%; box-sizing: border-box;
+                            border-radius: 8px; border: 1px solid #555; background:#3b3b3b; color:#eee; }
+            button { background: #0a66ff; color: #fff; border: none; cursor: pointer; font-weight: 700; }
+            button:hover { background: #0a55d3; }
+            #result { font-size: 32px; font-weight: 800; margin-top: 16px; }
+            label { font-size: 12px; color: #bbb; }
+            small { color:#b9a97c }
+            a.dl { color:#9ad; text-decoration:none; }
+            .muted { color:#aaa; font-size:12px; }
+        </style>
     </head>
     <body>
-      <a class="ui" href="/ui" target="_self">→ Yeni Dash Arayüzüne Git</a>
-      <h2>LOS Tahmin (Basit Form)</h2>
-      <div class="muted">Sunucu durumu: <span id="ready">kontrol ediliyor…</span></div>
-      <form id="predictForm">
-        <label>ICD Listesi (virgül, ||, boşluk vs.):</label>
-        <input type="text" id="icd_list" name="icd_list" value="A00||C91.0 T81.4, Z94.8">
-        <label>Bölüm (ops.):</label>
-        <input type="text" id="bolum" name="bolum" placeholder="örn. Kardiyoloji">
-        <label>Yaş Grubu (ops.):</label>
-        <input type="text" id="yas_grup" name="yas_grup" placeholder="örn. 0-1">
-        <button type="submit">Tahmin Et</button>
-      </form>
-      <div id="result"></div>
-      <p><small>/predict sadece sayı döndürür. Tam JSON ve ANCHOR bilgileri için <code>POST /predict_json</code> kullan.</small></p>
-      <p>
-        <small>
-          Hızlı indirme:
-          <a class="dl" href="/download/lookup">Lookup XLSX</a> ·
-          <a class="dl" href="/download/pred_los">PRED_LOS.xlsx</a> ·
-          <a class="dl" href="/download/valid">VALID_PREDICTIONS.xlsx</a> ·
-          <a class="dl" href="/download/yeni">YeniVakalar.xlsx</a>
-        </small>
-      </p>
-      <script>
-      async function pingReady(){
-        try{
-          const r = await fetch("/ready");
-          const j = await r.json();
-          document.getElementById("ready").textContent = j.ready ? "hazır" : (j.error ? "hata: "+j.error : "ısınma");
-        }catch(e){
-          document.getElementById("ready").textContent = "bilinmiyor";
-        }
-      }
-      pingReady(); setInterval(pingReady, 2000);
+        <a class="ui" href="/ui" target="_self">→ Yeni Dash Arayüzüne Git</a>
+        <h2>LOS Tahmin (Basit Form)</h2>
+        <div class="muted">Sunucu durumu: <span id="ready">kontrol ediliyor…</span></div>
+        <form id="predictForm">
+            <label>ICD Listesi (virgül, ||, boşluk vs. hepsi olur):</label>
+            <input type="text" id="icd_list" name="icd_list" value="A00||C91.0 T81.4, Z94.8">
 
-      function splitAny(s) {
-        if (!s) return [];
-        s = s.replaceAll("||","|");
-        return s.split(/[,;|\\s]+/).map(x => x.trim()).filter(Boolean);
-      }
+            <label>Bölüm (ops.):</label>
+            <input type="text" id="bolum" name="bolum" placeholder="örn. Kardiyoloji">
 
-      document.getElementById("predictForm").addEventListener("submit", async (e) => {
-        e.preventDefault();
-        const icdRaw = document.getElementById("icd_list").value;
-        const icd = splitAny(icdRaw);
-        const bolum = document.getElementById("bolum").value.trim();
-        const yas   = document.getElementById("yas_grup").value.trim();
-        const body = { icd_list: icd, bolum: bolum || null, yas_grup: yas || null };
-        const resEl = document.getElementById("result");
-        resEl.textContent = "…";
-        try {
-          const res = await fetch("/predict", {
-            method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body)
-          });
-          if(!res.ok){
-            const j = await res.json().catch(()=>({}));
-            resEl.textContent = "Hata: " + (j.detail || res.status);
-            return;
+            <label>Yaş Grubu (ops.):</label>
+            <input type="text" id="yas_grup" name="yas_grup" placeholder="örn. 0-1">
+
+            <button type="submit">Tahmin Et</button>
+        </form>
+
+        <div id="result"></div>
+
+        <p><small>/predict sadece sayı döndürür. Tam JSON ve ANCHOR bilgileri için <code>POST /predict_json</code> kullan.</small></p>
+
+        <p>
+          <small>
+            Hızlı indirme: 
+            <a class="dl" href="/download/lookup">Lookup XLSX</a> ·
+            <a class="dl" href="/download/pred_los">PRED_LOS.xlsx</a> ·
+            <a class="dl" href="/download/valid">VALID_PREDICTIONS.xlsx</a> ·
+            <a class="dl" href="/download/yeni">YeniVakalar.xlsx</a>
+          </small>
+        </p>
+
+        <script>
+        async function pingReady(){
+          try{
+            const r = await fetch("/ready");
+            const j = await r.json();
+            document.getElementById("ready").textContent = j.ready ? "hazır" : (j.error ? "hata: "+j.error : "ısınma");
+          }catch(e){
+            document.getElementById("ready").textContent = "bilinmiyor";
           }
-          const text = await res.text();   // sadece sayı dönüyor
-          resEl.textContent = text;
-        } catch (err) {
-          resEl.textContent = "Hata: " + (err?.message || err);
         }
-      });
-      </script>
+        pingReady(); setInterval(pingReady, 2000);
+
+        function splitAny(s) {
+          if (!s) return [];
+          s = s.replaceAll("||","|");
+          return s.split(/[,;|\\s]+/).map(x => x.trim()).filter(Boolean);
+        }
+
+        document.getElementById("predictForm").addEventListener("submit", async (e) => {
+            e.preventDefault();
+            const icdRaw = document.getElementById("icd_list").value;
+            const icd = splitAny(icdRaw);
+
+            const bolum = document.getElementById("bolum").value.trim();
+            const yas   = document.getElementById("yas_grup").value.trim();
+
+            const body = { icd_list: icd, bolum: bolum || null, yas_grup: yas || null };
+            const resEl = document.getElementById("result");
+            resEl.textContent = "…";
+
+            try {
+                const res = await fetch("/predict", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(body)
+                });
+                if(!res.ok){
+                  const j = await res.json().catch(()=>({}));
+                  resEl.textContent = "Hata: " + (j.detail || res.status);
+                  return;
+                }
+                const text = await res.text();   // sadece sayı dönüyor
+                resEl.textContent = text;
+            } catch (err) {
+                resEl.textContent = "Hata: " + (err?.message || err);
+            }
+        });
+        </script>
     </body>
     </html>
     """
+
 
 # ---------------- Sağlık / bilgi ----------------
 @app.get("/health")
@@ -193,6 +216,11 @@ def health():
 @app.get("/ready", response_class=JSONResponse)
 def ready():
     return {"ready": MODEL_READY, "mode": MODEL_MODE, "error": MODEL_ERROR}
+
+@app.get("/info", response_class=JSONResponse)
+def info():
+    return {"ready": MODEL_READY, "mode": MODEL_MODE, "error": MODEL_ERROR}
+
 
 # ---------------- Tahmin uçları ----------------
 @app.post("/predict", response_class=PlainTextResponse)
@@ -215,11 +243,11 @@ def predict_json(req: PredictRequest):
         msg = "Model hazır değil (ısınma sürüyor)." + (f" Hata: {MODEL_ERROR}" if MODEL_ERROR else "")
         raise HTTPException(status_code=503, detail=msg)
     try:
-        # Doğrudan tahmin_et ile detay istersen burada genişletebilirsin
-        out = tahmin_et(req.icd_list, req.bolum, req.yas_grup)
+        out = app_predict(req.yas_grup or "", req.bolum or "", req.icd_list)
         return out
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Hata: {e}")
+
 
 # ---------------- Dosya indirme ----------------
 def _file_or_404(path: str, download_name: Optional[str] = None) -> FileResponse:
@@ -245,11 +273,12 @@ def download_yeni():
 
 @app.get("/download/model/{name}")
 def download_model_file(name: str):
-    safe = re.fullmatch(r"[A-Za-z0-9_.\-]+", name)
+    safe = re.fullmatch(r"[A-Za-z0-9_.\\-]+", name)
     if not safe:
         raise HTTPException(status_code=400, detail="Geçersiz dosya adı")
     path = os.path.join(MODEL_DIR, name)
     return _file_or_404(path)
+
 
 # ---------------- Form-POST (opsiyonel) ----------------
 @app.post("/tahmin", response_class=PlainTextResponse)
@@ -272,86 +301,71 @@ def tahmin_form(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Hata: {e}")
 
+
 # ============================================================
-#              LOOKUP YÜKLEME (Sadece Excel)
+#                LOOKUP YÜKLEME (LOS_Lookup_All.xlsx)
 # ============================================================
-import pandas as pd  # Excel için
+import pandas as pd
 
-def _load_lookups():
+def _unique_clean(xs):
+    seen, out = set(), []
+    for x in xs:
+        s = str(x).strip()
+        if s and s not in seen:
+            seen.add(s); out.append(s)
+    return out
+
+def _load_lookups_from_excel(path: str):
     """
-    Sadece Excel kaynakları:
-      - LOS_Lookup_All.xlsx: DIM_ICD ve DIM_YASGRUP
-      - Veri2024.xlsx: BOLUM sütunundan benzersiz liste
-    Eksik dosya/sayfa varsa statik fallback devreye girer.
+    Öncelik: sheet adları olarak DIM_ICD, DIM_YASGRUP, DIM_BOLUM.
+    Eğer bu adlar sheet değilse; ilk sheet’te aynı isimli SÜTUNLAR aranır.
     """
-    # Statik fallback
-    age_groups = ["0-1","2-5","5-10","10-15","15-25","25-35","35-50","50-65","65+"]
-    bolum_list = ["Dahiliye","Kardiyoloji","Genel Cerrahi","Yoğun Bakım","Pediatri"]
-    icd_all = [
-        'J18.9','E11.65','I10','A41.9','N39.0','K52.9','J44.1','I50.9',
-        'E03.9','E78.5','I21.9','J12.9','E11.9','I63.9','G45.9','K21.9',
-        'M54.5','R07.9','R10.4','R06.0','R50.9','R53.1','D64.9','R42',
-    ]
+    if not os.path.exists(path):
+        # dosya yoksa boş listeler dön; UI minimal çalışır
+        return [], [], []
 
-    # 1) LOS_Lookup_All.xlsx → DIM_ICD, DIM_YASGRUP
     try:
-        if os.path.exists(LOOKUP_XLSX):
-            x = pd.ExcelFile(LOOKUP_XLSX)
-            # DIM_ICD
-            if "DIM_ICD" in x.sheet_names:
-                df_icd = pd.read_excel(x, "DIM_ICD")
-                col_icd = next((c for c in df_icd.columns if "ICD" in c.upper()), None)
-                if col_icd:
-                    icd_all = (
-                        df_icd[col_icd].dropna().astype(str).str.strip().unique().tolist()
-                    )
-                    icd_all.sort()
-            # DIM_YASGRUP
-            if "DIM_YASGRUP" in x.sheet_names:
-                df_yas = pd.read_excel(x, "DIM_YASGRUP")
-                col_yas = next((c for c in df_yas.columns if "YAS" in c.upper()), None)
-                if col_yas:
-                    age_groups = (
-                        df_yas[col_yas].dropna().astype(str).str.strip().unique().tolist()
-                    )
-                    # yaş gruplarında sıralama sözlüklemeye göre değişebilir, dokunmuyoruz
+        xls = pd.ExcelFile(path)
+        sheet_names = {s.lower(): s for s in xls.sheet_names}
+
+        def read_sheet_or_column(sheet_key: str, col_key: str):
+            # 1) Sheet adıyla
+            if sheet_key.lower() in sheet_names:
+                df = pd.read_excel(xls, sheet_names[sheet_key.lower()], engine="openpyxl")
+                # Tek sütun ise isimsiz gelebilir -> tüm değerleri topla
+                series = df.iloc[:, 0]
+                return _unique_clean(series.dropna().astype(str).tolist())
+            # 2) İlk sheet'te kolonu ara
+            df0 = pd.read_excel(xls, sheet_names[list(sheet_names.keys())[0]], engine="openpyxl")
+            # Kolon adını case-insensitive arıyoruz
+            col = None
+            for c in df0.columns:
+                if str(c).strip().lower() == col_key.lower():
+                    col = c; break
+            if col is not None:
+                return _unique_clean(df0[col].dropna().astype(str).tolist())
+            return []
+
+        icd_list   = read_sheet_or_column("DIM_ICD", "DIM_ICD")
+        yas_list   = read_sheet_or_column("DIM_YASGRUP", "DIM_YASGRUP")
+        bolum_list = read_sheet_or_column("DIM_BOLUM", "DIM_BOLUM")
+
+        return icd_list, yas_list, bolum_list
+
     except Exception as e:
-        print("[LOOKUP] LOS_Lookup_All.xlsx okunamadı:", e)
+        print("[LOOKUP][ERROR]", e)
+        return [], [], []
 
-    # 2) Veri2024.xlsx → BOLUM
-    try:
-        if os.path.exists("Veri2024.xlsx"):
-            df_veri = pd.read_excel("Veri2024.xlsx")
-            for col in ["BOLUM", "BÖLÜM", "BRANS_ADI", "SERVIS", "KLINIK"]:
-                if col in df_veri.columns:
-                    bolum_list = (
-                        df_veri[col].dropna().astype(str).str.strip().unique().tolist()
-                    )
-                    bolum_list.sort()
-                    break
-    except Exception as e:
-        print("[LOOKUP] Veri2024.xlsx okunamadı:", e)
-
-    # Temizlik (uniq + boşları at)
-    def _clean(xs):
-        seen, out = set(), []
-        for x in xs or []:
-            s = str(x).strip()
-            if s and s not in seen:
-                seen.add(s); out.append(s)
-        return out
-
-    return _clean(age_groups), _clean(bolum_list), _clean(icd_all)
-
-AGE_GROUPS_LIST, BOLUM_LIST_LIST, ICD_ALL_LIST = _load_lookups()
+ICD_ALL_LIST, AGE_GROUPS_LIST, BOLUM_LIST_LIST = _load_lookups_from_excel(LOOKUP_XLSX)
 
 @app.get("/lookup", response_class=JSONResponse)
 def lookup_all():
     return {
+        "icd_all": ICD_ALL_LIST,
         "age_groups": AGE_GROUPS_LIST,
         "bolum_list": BOLUM_LIST_LIST,
-        "icd_all": ICD_ALL_LIST,
     }
+
 
 # ============================================================
 #                    DASH UI'YI /ui ALTINA MONTAJ
@@ -378,7 +392,12 @@ def _filter_list(all_items, query, selected_vals):
     return head + tail
 
 def build_dash_app() -> Dash:
-    dash_app = Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP], requests_pathname_prefix="/ui/")
+    dash_app = Dash(
+        __name__,
+        external_stylesheets=[dbc.themes.BOOTSTRAP],
+        requests_pathname_prefix="/ui/",     # ÖNEMLİ: /ui altında çalışsın
+        update_title=None,
+    )
     dash_app.index_string = """
     <!DOCTYPE html>
     <html>
@@ -557,13 +576,15 @@ def build_dash_app() -> Dash:
 
     return dash_app
 
-# Dash uygulamasını oluştur ve /ui altına bağla
-from starlette.middleware.wsgi import WSGIMiddleware
+
 _dash = build_dash_app()
-app.mount("/ui", WSGIMiddleware(_dash.server))
+app.mount("/ui", WSGIMiddleware(_dash.server))  # Dash'ı /ui altına bağla
+
 
 # ---------------- Lokal çalıştırıcı ----------------
 if __name__ == "__main__":
+    # Render'da Start Command olarak şunu kullanın:
+    # uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1
     import uvicorn
     port = int(os.environ.get("PORT", "10000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, workers=1)

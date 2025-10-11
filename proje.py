@@ -71,7 +71,7 @@ WINSOR_HI          = 0.9785
 
 XGB_ENS_ON         = True
 XGB_ALPHA_LOG      = 0.20
-XGB_RULE_BLEND     = 0.60
+XGB_RULE_BLEND     = 0.55
 XGB_PARAMS = dict(
     n_estimators=400, learning_rate=0.05, max_depth=6,
     subsample=0.8, colsample_bytree=0.8,
@@ -413,6 +413,8 @@ def run_training_pipeline():
     _age_order = ["0-1","2-5","5-10","10-15","15-25","25-35","35-50","50-65","65+"]
     _present = [yg for yg in _age_order if yg in set(df["YaşGrup"].dropna().astype(str).unique())]
     DIM_YASGRUP = pd.DataFrame({"YaşGrup": _present})
+    # ---- EKLENDİ: DIM_BOLUM (birebir yeni sayfa) ----
+    DIM_BOLUM = pd.DataFrame({"Bölüm": sorted(df["Bölüm"].dropna().astype(str).unique())})
 
     if GENERATE_LOOKUP_EXCEL:
         with pd.ExcelWriter(LOOKUP_XLSX, engine="xlsxwriter") as w:
@@ -430,6 +432,8 @@ def run_training_pipeline():
             BR_ICDSET_MAP.to_excel(w, index=False, sheet_name="BR_ICDSET_MAP")
             DIM_ICD.to_excel(w, index=False, sheet_name="DIM_ICD")
             DIM_YASGRUP.to_excel(w, index=False, sheet_name="DIM_YASGRUP")
+            # ---- EKLENDİ: yeni sayfa yazımı ----
+            DIM_BOLUM.to_excel(w, index=False, sheet_name="DIM_BOLUM")
         print(f"OK -> {LOOKUP_XLSX}")
 
     # ================== 6) ANCHOR / PREDICT ==================
