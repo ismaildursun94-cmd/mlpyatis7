@@ -39,7 +39,7 @@ GENERATE_LOOKUP_EXCEL       = True   # Lookup Excel'i yaz
 GENERATE_PRED_LOS           = False  # PRED_LOS.xlsx üret
 GENERATE_VALID_PREDICTIONS  = False  # VALID_PREDICTIONS.xlsx üret
 
-MAKE_YENI_VAKALAR  = False
+MAKE_YENI_VAKALAR  = True
 YENI_VAKALAR_XLSX  = "YeniVakalar.xlsx"
 PRED_LOS_XLSX      = "PRED_LOS.xlsx"
 VALID_PRED_XLSX    = "VALID_PREDICTIONS.xlsx"
