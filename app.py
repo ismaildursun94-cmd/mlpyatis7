@@ -273,7 +273,7 @@ def download_yeni():
 
 @app.get("/download/model/{name}")
 def download_model_file(name: str):
-    safe = re.fullmatch(r"[A-Za-z0-9_.\\-]+", name)
+    safe = re.fullmatch(r"[A-Za-z0-9_.\-]+", name)
     if not safe:
         raise HTTPException(status_code=400, detail="Geçersiz dosya adı")
     path = os.path.join(MODEL_DIR, name)
@@ -407,8 +407,8 @@ def build_dash_app() -> Dash:
         external_stylesheets=[dbc.themes.BOOTSTRAP],
         requests_pathname_prefix="/ui/",
         update_title=None,
-        serve_locally=True,               # asset'leri local servis et
-        suppress_callback_exceptions=True # güvenli yanıt
+        serve_locally=True,
+        suppress_callback_exceptions=True,
     )
     dash_app.index_string = """
     <!DOCTYPE html>
@@ -535,7 +535,7 @@ def build_dash_app() -> Dash:
     def filter_icd(search_value, current_values):
         return _filter_list(ICD_ALL_LIST, search_value, current_values or [])
 
-    # ---- TEK callback: ICD limit + Reset (duplicate outputs sorunsuz)
+    # ---- ICD limit + Reset (ICD temizleme)
     from dash import callback_context as ctx
 
     @dash_app.callback(
@@ -547,7 +547,7 @@ def build_dash_app() -> Dash:
         prevent_initial_call=True,
     )
     def icd_value_and_limit(values, reset_clicks):
-        trigger = (ctx.triggered[0]["prop_id"] if ctx.triggered else "")  # "icd.value" | "reset.n_clicks"
+        trigger = (ctx.triggered[0]["prop_id"] if ctx.triggered else "")
         if trigger.startswith("reset"):
             return [], False, no_update
         values = values or []
@@ -556,7 +556,17 @@ def build_dash_app() -> Dash:
         trimmed = values[:15]
         return trimmed, True, "En fazla 15 ICD seçebilirsiniz."
 
-    # ---- TEK callback: Tahmin + Reset mesajı
+    # ---- YAŞ & BÖLÜM de resetlensin (asıl düzeltme)
+    @dash_app.callback(
+        Output("age", "value"),
+        Output("bolum", "value"),
+        Input("reset", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def reset_age_bolum(_):
+        return None, None
+
+    # ---- Tahmin + Reset mesajı
     @dash_app.callback(
         Output("prediction", "children"),
         Output("api-alert", "is_open"),
