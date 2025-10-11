@@ -8,24 +8,15 @@ from fastapi import FastAPI, HTTPException, Form
 from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse, FileResponse
 from pydantic import BaseModel, field_validator
 
-# === Proje fonksiyonları (model + bilgi) ===
-from proje import tahmin_et, app_predict, app_info, run_training_pipeline
+# === Proje fonksiyonları (model) ===
+from proje import tahmin_et, run_training_pipeline  # app_info kaldırıldı
 
-# ---- Opsiyonel sabitler (fallback) ----
-try:
-    from proje import (
-        LOOKUP_XLSX,
-        PRED_LOS_XLSX,
-        VALID_PRED_XLSX,
-        YENI_VAKALAR_XLSX,
-        MODEL_DIR,
-    )
-except Exception:
-    LOOKUP_XLSX = "LOS_Lookup_All.xlsx"
-    PRED_LOS_XLSX = "PRED_LOS.xlsx"
-    VALID_PRED_XLSX = "VALID_PREDICTIONS.xlsx"
-    YENI_VAKALAR_XLSX = "YeniVakalar.xlsx"
-    MODEL_DIR = "model_out"
+# ---- Sabitler (dosya adları) ----
+LOOKUP_XLSX     = os.environ.get("LOOKUP_XLSX", "LOS_Lookup_All.xlsx")
+PRED_LOS_XLSX   = os.environ.get("PRED_LOS_XLSX", "PRED_LOS.xlsx")
+VALID_PRED_XLSX = os.environ.get("VALID_PRED_XLSX", "VALID_PREDICTIONS.xlsx")
+YENI_VAKALAR_XLSX = os.environ.get("YENI_VAKALAR_XLSX", "YeniVakalar.xlsx")
+MODEL_DIR       = os.environ.get("MODEL_DIR", "model_out")
 
 # ============================================================
 #                FASTAPI (API) + MODEL ISINMA
@@ -203,13 +194,6 @@ def health():
 def ready():
     return {"ready": MODEL_READY, "mode": MODEL_MODE, "error": MODEL_ERROR}
 
-@app.get("/info", response_class=JSONResponse)
-def info():
-    try:
-        return app_info()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Hata: {e}")
-
 # ---------------- Tahmin uçları ----------------
 @app.post("/predict", response_class=PlainTextResponse)
 def predict(req: PredictRequest):
@@ -231,7 +215,8 @@ def predict_json(req: PredictRequest):
         msg = "Model hazır değil (ısınma sürüyor)." + (f" Hata: {MODEL_ERROR}" if MODEL_ERROR else "")
         raise HTTPException(status_code=503, detail=msg)
     try:
-        out = app_predict(req.yas_grup or "", req.bolum or "", req.icd_list)
+        # Doğrudan tahmin_et ile detay istersen burada genişletebilirsin
+        out = tahmin_et(req.icd_list, req.bolum, req.yas_grup)
         return out
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Hata: {e}")
@@ -288,37 +273,75 @@ def tahmin_form(
         raise HTTPException(status_code=500, detail=f"Hata: {e}")
 
 # ============================================================
-#                   LOOKUP YÜKLEME (Excel / app_info)
+#              LOOKUP YÜKLEME (Sadece Excel)
 # ============================================================
+import pandas as pd  # Excel için
+
 def _load_lookups():
     """
-    Öncelik: app_info() içinden listeler geliyorsa onları kullan.
-    Aksi halde Excel veya son çare statik fallback.
+    Sadece Excel kaynakları:
+      - LOS_Lookup_All.xlsx: DIM_ICD ve DIM_YASGRUP
+      - Veri2024.xlsx: BOLUM sütunundan benzersiz liste
+    Eksik dosya/sayfa varsa statik fallback devreye girer.
     """
-    AGE_GROUPS = ["0-1","2-5","5-10","10-15","15-25","25-35","35-50","50-65","65+"]
-    BOLUM_LIST = ["Dahiliye","Kardiyoloji","Genel Cerrahi","Yoğun Bakım","Pediatri"]
-    ICD_ALL = [
+    # Statik fallback
+    age_groups = ["0-1","2-5","5-10","10-15","15-25","25-35","35-50","50-65","65+"]
+    bolum_list = ["Dahiliye","Kardiyoloji","Genel Cerrahi","Yoğun Bakım","Pediatri"]
+    icd_all = [
         'J18.9','E11.65','I10','A41.9','N39.0','K52.9','J44.1','I50.9',
         'E03.9','E78.5','I21.9','J12.9','E11.9','I63.9','G45.9','K21.9',
         'M54.5','R07.9','R10.4','R06.0','R50.9','R53.1','D64.9','R42',
     ]
+
+    # 1) LOS_Lookup_All.xlsx → DIM_ICD, DIM_YASGRUP
     try:
-        info = app_info() or {}
-        AGE_GROUPS = info.get("age_groups", AGE_GROUPS) or AGE_GROUPS
-        BOLUM_LIST = info.get("bolum_list", BOLUM_LIST) or BOLUM_LIST
-        ICD_ALL = info.get("icd_all", ICD_ALL) or ICD_ALL
-    except Exception:
-        # İstersek burada pandas ile LOOKUP_XLSX okunabilir
-        pass
-    # String'e çevir ve uniq yap (olası NaN vs. temizliği)
+        if os.path.exists(LOOKUP_XLSX):
+            x = pd.ExcelFile(LOOKUP_XLSX)
+            # DIM_ICD
+            if "DIM_ICD" in x.sheet_names:
+                df_icd = pd.read_excel(x, "DIM_ICD")
+                col_icd = next((c for c in df_icd.columns if "ICD" in c.upper()), None)
+                if col_icd:
+                    icd_all = (
+                        df_icd[col_icd].dropna().astype(str).str.strip().unique().tolist()
+                    )
+                    icd_all.sort()
+            # DIM_YASGRUP
+            if "DIM_YASGRUP" in x.sheet_names:
+                df_yas = pd.read_excel(x, "DIM_YASGRUP")
+                col_yas = next((c for c in df_yas.columns if "YAS" in c.upper()), None)
+                if col_yas:
+                    age_groups = (
+                        df_yas[col_yas].dropna().astype(str).str.strip().unique().tolist()
+                    )
+                    # yaş gruplarında sıralama sözlüklemeye göre değişebilir, dokunmuyoruz
+    except Exception as e:
+        print("[LOOKUP] LOS_Lookup_All.xlsx okunamadı:", e)
+
+    # 2) Veri2024.xlsx → BOLUM
+    try:
+        if os.path.exists("Veri2024.xlsx"):
+            df_veri = pd.read_excel("Veri2024.xlsx")
+            for col in ["BOLUM", "BÖLÜM", "BRANS_ADI", "SERVIS", "KLINIK"]:
+                if col in df_veri.columns:
+                    bolum_list = (
+                        df_veri[col].dropna().astype(str).str.strip().unique().tolist()
+                    )
+                    bolum_list.sort()
+                    break
+    except Exception as e:
+        print("[LOOKUP] Veri2024.xlsx okunamadı:", e)
+
+    # Temizlik (uniq + boşları at)
     def _clean(xs):
         seen, out = set(), []
-        for x in xs:
+        for x in xs or []:
             s = str(x).strip()
             if s and s not in seen:
                 seen.add(s); out.append(s)
         return out
-    return _clean(AGE_GROUPS), _clean(BOLUM_LIST), _clean(ICD_ALL)
+
+    return _clean(age_groups), _clean(bolum_list), _clean(icd_all)
 
 AGE_GROUPS_LIST, BOLUM_LIST_LIST, ICD_ALL_LIST = _load_lookups()
 
@@ -333,7 +356,6 @@ def lookup_all():
 # ============================================================
 #                    DASH UI'YI /ui ALTINA MONTAJ
 # ============================================================
-# Dash (Flask) -> FastAPI'ye WSGI ile monte
 from dash import Dash, html, dcc, callback, Output, Input, State, no_update
 import dash_bootstrap_components as dbc
 import unicodedata
@@ -535,8 +557,10 @@ def build_dash_app() -> Dash:
 
     return dash_app
 
+# Dash uygulamasını oluştur ve /ui altına bağla
+from starlette.middleware.wsgi import WSGIMiddleware
 _dash = build_dash_app()
-app.mount("/ui", WSGIMiddleware(_dash.server))  # Dash'ı /ui altına bağla
+app.mount("/ui", WSGIMiddleware(_dash.server))
 
 # ---------------- Lokal çalıştırıcı ----------------
 if __name__ == "__main__":
