@@ -26,10 +26,10 @@ MODEL_DIR = os.environ.get("MODEL_DIR", "model_out")
 # ============================================================
 #                FASTAPI (API) + MODEL ISINMA
 # ============================================================
-app = FastAPI(title="LOS Predictor API", version="1.3.0")
+app = FastAPI(title="LOS Predictor API", version="1.4.0")
 
 MODEL_READY: bool = False
-MODEL_MODE: str = os.environ.get("MODE", "train").lower()  # "train" | "load" (şimdilik train)
+MODEL_MODE: str = os.environ.get("MODE", "train").lower()
 MODEL_ERROR: Optional[str] = None
 
 
@@ -306,6 +306,7 @@ def tahmin_form(
 #                LOOKUP YÜKLEME (LOS_Lookup_All.xlsx)
 # ============================================================
 import pandas as pd
+import unicodedata
 
 def _unique_clean(xs):
     seen, out = set(), []
@@ -316,47 +317,57 @@ def _unique_clean(xs):
     return out
 
 def _load_lookups_from_excel(path: str):
-    """
-    Öncelik: sheet adları olarak DIM_ICD, DIM_YASGRUP, DIM_BOLUM.
-    Eğer bu adlar sheet değilse; ilk sheet’te aynı isimli SÜTUNLAR aranır.
-    """
-    if not os.path.exists(path):
-        # dosya yoksa boş listeler dön; UI minimal çalışır
-        return [], [], []
+    """DIM_ICD ve DIM_YASGRUP'u Excel'den çek; BÖLÜM sabit listeden gelecek."""
+    icd_list, yas_list = [], []
+    if os.path.exists(path):
+        try:
+            xls = pd.ExcelFile(path)
+            sheet_names = {s.lower(): s for s in xls.sheet_names}
 
-    try:
-        xls = pd.ExcelFile(path)
-        sheet_names = {s.lower(): s for s in xls.sheet_names}
+            def read_sheet_or_column(sheet_key: str, col_key: str):
+                if sheet_key.lower() in sheet_names:
+                    df = pd.read_excel(xls, sheet_names[sheet_key.lower()], engine="openpyxl")
+                    series = df.iloc[:, 0]
+                    return _unique_clean(series.dropna().astype(str).tolist())
+                # ilk sheet'te kolonu ara (fallback)
+                df0 = pd.read_excel(xls, sheet_names[list(sheet_names.keys())[0]], engine="openpyxl")
+                col = None
+                for c in df0.columns:
+                    if str(c).strip().lower() == col_key.lower():
+                        col = c; break
+                if col is not None:
+                    return _unique_clean(df0[col].dropna().astype(str).tolist())
+                return []
 
-        def read_sheet_or_column(sheet_key: str, col_key: str):
-            # 1) Sheet adıyla
-            if sheet_key.lower() in sheet_names:
-                df = pd.read_excel(xls, sheet_names[sheet_key.lower()], engine="openpyxl")
-                # Tek sütun ise isimsiz gelebilir -> tüm değerleri topla
-                series = df.iloc[:, 0]
-                return _unique_clean(series.dropna().astype(str).tolist())
-            # 2) İlk sheet'te kolonu ara
-            df0 = pd.read_excel(xls, sheet_names[list(sheet_names.keys())[0]], engine="openpyxl")
-            # Kolon adını case-insensitive arıyoruz
-            col = None
-            for c in df0.columns:
-                if str(c).strip().lower() == col_key.lower():
-                    col = c; break
-            if col is not None:
-                return _unique_clean(df0[col].dropna().astype(str).tolist())
-            return []
+            icd_list = read_sheet_or_column("DIM_ICD", "DIM_ICD")
+            yas_list = read_sheet_or_column("DIM_YASGRUP", "DIM_YASGRUP")
+        except Exception as e:
+            print("[LOOKUP][ERROR]", e)
 
-        icd_list   = read_sheet_or_column("DIM_ICD", "DIM_ICD")
-        yas_list   = read_sheet_or_column("DIM_YASGRUP", "DIM_YASGRUP")
-        bolum_list = read_sheet_or_column("DIM_BOLUM", "DIM_BOLUM")
+    return icd_list, yas_list
 
-        return icd_list, yas_list, bolum_list
+# — ICD & Yaş Excel’den
+ICD_ALL_LIST, AGE_GROUPS_LIST = _load_lookups_from_excel(LOOKUP_XLSX)
 
-    except Exception as e:
-        print("[LOOKUP][ERROR]", e)
-        return [], [], []
-
-ICD_ALL_LIST, AGE_GROUPS_LIST, BOLUM_LIST_LIST = _load_lookups_from_excel(LOOKUP_XLSX)
+# — Bölüm SABİT (gönderdiğin liste)
+BOLUM_LIST_LIST = _unique_clean([
+    "Acil TIP", "Algoloji", "Anestezi ve Reanimasyon", "Anestezi ve Reanimasyon (GYB)",
+    "Ağız ve Diş Sağlığı", "Beyin ve Sinir Cerrahisi", "Check Up", "Dermatoloji", "Endokrinoloji",
+    "Enfeksiyon Hastalıkları", "Fizik Tedavi ve Rehabilitasyon", "Gastroenteroloji",
+    "Gastroenteroloji Cerrahisi", "Genel Cerrahi", "Girişimsel Radyoloji",
+    "GÖĞÜS HASTALIKLARI YOĞUN BAKIM", "Göz Hastalıkları", "Göğüs Cerrahisi", "Göğüs Hastalıkları",
+    "Hematoloji Polikliniği", "Jinekoloji Onkoloji Cerrahisi", "KBB Hastalıkları", "KVC Yoğun Bakım",
+    "Kadın Hastalıkları ve Doğum", "Kalp ve Damar Cerrahisi", "Kardiyoloji", "Koroner Yoğun Bakım",
+    "Laboratuvar", "Meme Cerrahisi", "Nefroloji", "Neonatoloji", "Nöroloji", "Nükleer TIP",
+    "Obezite Cerrahisi", "Organ Nakli", "Organ Nakli (Genel Cerrahii)", "Ortopedi ve Travmatoloji",
+    "Plastik Cerrahi", "Psikiyatri", "Radyasyon Onkolojisi", "Radyoloji", "Romatoloji", "Saç Ekimi",
+    "Tüp Bebek", "Tıbbi Onkoloji", "Yenidoğan Yoğun Bakım", "Çocuk Cerrahisi",
+    "Çocuk Enfeksiyon Hastalıkları", "Çocuk Gastroentroloji", "Çocuk Hematolojisi",
+    "Çocuk Hematolojisi ve Onkolojisi", "Çocuk Kardiyoloji", "Çocuk Nefrolojisi",
+    "Çocuk Nörolojisi", "Çocuk Sağlığı ve Hastalıkları",
+    "Çocuk İmmünolojisi ve Alerji Hastalıkları", "Üroloji",
+    "İÇ HASTALIKLARI YOĞUN BAKIM", "İç Hastalıkları",
+])
 
 @app.get("/lookup", response_class=JSONResponse)
 def lookup_all():
@@ -372,7 +383,6 @@ def lookup_all():
 # ============================================================
 from dash import Dash, html, dcc, callback, Output, Input, State, no_update
 import dash_bootstrap_components as dbc
-import unicodedata
 from starlette.middleware.wsgi import WSGIMiddleware
 
 def _tr_fold(s: str) -> str:
@@ -395,8 +405,10 @@ def build_dash_app() -> Dash:
     dash_app = Dash(
         __name__,
         external_stylesheets=[dbc.themes.BOOTSTRAP],
-        requests_pathname_prefix="/ui/",     # ÖNEMLİ: /ui altında çalışsın
+        requests_pathname_prefix="/ui/",
         update_title=None,
+        serve_locally=True,               # asset'leri local servis et
+        suppress_callback_exceptions=True # güvenli yanıt
     )
     dash_app.index_string = """
     <!DOCTYPE html>
@@ -495,7 +507,7 @@ def build_dash_app() -> Dash:
         fluid=True,
     )
 
-    # ---- Callbacks ----
+    # ---- Arama filtreleri ----
     @dash_app.callback(
         Output("age", "options"),
         Input("age", "search_value"),
@@ -523,17 +535,44 @@ def build_dash_app() -> Dash:
     def filter_icd(search_value, current_values):
         return _filter_list(ICD_ALL_LIST, search_value, current_values or [])
 
+    # ---- TEK callback: ICD limit + Reset (duplicate outputs sorunsuz)
+    from dash import callback_context as ctx
+
+    @dash_app.callback(
+        Output("icd", "value"),
+        Output("limit-alert", "is_open"),
+        Output("limit-alert", "children"),
+        Input("icd", "value"),
+        Input("reset", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def icd_value_and_limit(values, reset_clicks):
+        trigger = (ctx.triggered[0]["prop_id"] if ctx.triggered else "")  # "icd.value" | "reset.n_clicks"
+        if trigger.startswith("reset"):
+            return [], False, no_update
+        values = values or []
+        if len(values) <= 15:
+            return values, False, no_update
+        trimmed = values[:15]
+        return trimmed, True, "En fazla 15 ICD seçebilirsiniz."
+
+    # ---- TEK callback: Tahmin + Reset mesajı
     @dash_app.callback(
         Output("prediction", "children"),
         Output("api-alert", "is_open"),
         Output("api-alert", "children"),
         Input("predict", "n_clicks"),
+        Input("reset", "n_clicks"),
         State("age", "value"),
         State("bolum", "value"),
         State("icd", "value"),
         prevent_initial_call=True,
     )
-    def do_predict(n, age, bolum, icds):
+    def do_predict_or_reset(p_click, r_click, age, bolum, icds):
+        trigger = (ctx.triggered[0]["prop_id"] if ctx.triggered else "")
+        if trigger.startswith("reset"):
+            return "—", False, no_update
+        # predict:
         if not age or not bolum or not (icds and len(icds) > 0):
             return "Tüm seçimleri yapın", True, "Lütfen Yaş Grubu, Bölüm ve en az 1 ICD seçin."
         if not MODEL_READY:
@@ -548,32 +587,6 @@ def build_dash_app() -> Dash:
         except Exception as e:
             return "—", True, f"Hata: {e}"
 
-    @dash_app.callback(
-        Output("icd", "value", allow_duplicate=True),
-        Output("limit-alert", "is_open"),
-        Output("limit-alert", "children"),
-        Input("icd", "value"),
-        prevent_initial_call=True,
-    )
-    def enforce_icd_limit(values):
-        values = values or []
-        if len(values) <= 15:
-            return values, False, no_update
-        trimmed = values[:15]
-        return trimmed, True, "En fazla 15 ICD seçebilirsiniz."
-
-    @dash_app.callback(
-        Output("age", "value"),
-        Output("bolum", "value"),
-        Output("icd", "value", allow_duplicate=True),
-        Output("prediction", "children", allow_duplicate=True),
-        Output("api-alert", "is_open"),
-        Input("reset", "n_clicks"),
-        prevent_initial_call=True,
-    )
-    def reset(_):
-        return None, None, [], "—", False
-
     return dash_app
 
 
@@ -583,7 +596,7 @@ app.mount("/ui", WSGIMiddleware(_dash.server))  # Dash'ı /ui altına bağla
 
 # ---------------- Lokal çalıştırıcı ----------------
 if __name__ == "__main__":
-    # Render'da Start Command olarak şunu kullanın:
+    # Render Start Command:
     # uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1
     import uvicorn
     port = int(os.environ.get("PORT", "10000"))
